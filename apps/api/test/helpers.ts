@@ -17,13 +17,16 @@ export async function createTestApp() {
   return { app, prisma: app.get(PrismaService) };
 }
 
-/** Vide toutes les tables (TRUNCATE ne déclenche pas les triggers « ajout seul ») puis réinitialise. */
+/**
+ * Vide toutes les tables (TRUNCATE ne déclenche pas les triggers « ajout seul ») puis réinitialise.
+ * Les référentiels alimentés par les migrations (units) sont conservés.
+ */
 export async function resetDatabase(prisma: PrismaService) {
   // Garde-fou : vérifie la base réellement connectée, pas seulement la configuration.
   const [{ db }] = await prisma.$queryRaw<{ db: string }[]>`SELECT current_database() AS db`;
   if (!db.endsWith('_test')) throw new Error(`Refus de vider la base « ${db} » : seule une base *_test est autorisée`);
   const tables = await prisma.$queryRaw<{ tablename: string }[]>`
-    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> '_prisma_migrations'`;
+    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename NOT IN ('_prisma_migrations', 'units')`;
   await prisma.$executeRawUnsafe(`TRUNCATE ${tables.map((t) => `"${t.tablename}"`).join(', ')} RESTART IDENTITY CASCADE`);
   const { company } = await bootstrapData(prisma, {
     companyName: 'AFRIKA FOOD Test',

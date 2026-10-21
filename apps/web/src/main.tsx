@@ -8,6 +8,10 @@ import './index.css';
 import { ApiError } from './lib/api';
 import { AuthProvider, useAuth } from './lib/auth';
 import { AuditPage } from './pages/Audit';
+import { CategoriesPage } from './pages/catalog/Categories';
+import { ProductsPage } from './pages/catalog/Products';
+import { RawMaterialsPage } from './pages/catalog/RawMaterials';
+import { SuppliersPage } from './pages/catalog/Suppliers';
 import { ChangePasswordPage } from './pages/ChangePassword';
 import { CompanyPage } from './pages/Company';
 import { EstablishmentsPage } from './pages/Establishments';
@@ -43,6 +47,10 @@ function App() {
         <Route path="audit" element={<AuditPage />} />
         <Route path="entreprise" element={<CompanyPage />} />
         <Route path="mot-de-passe" element={<ChangePasswordPage />} />
+        <Route path="produits" element={<ProductsPage />} />
+        <Route path="matieres" element={<RawMaterialsPage />} />
+        <Route path="fournisseurs" element={<SuppliersPage />} />
+        <Route path="categories" element={<CategoriesPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

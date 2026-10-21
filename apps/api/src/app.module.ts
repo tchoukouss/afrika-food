@@ -12,6 +12,7 @@ import { AuthService } from './auth/auth.service';
 import { Public } from './auth/decorators';
 import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 import { RequestContextMiddleware } from './common/request-context.middleware';
+import { CatalogModule } from './catalog/catalog.module';
 import { CompanyController, CompanyService } from './company/company';
 import { EstablishmentsController, EstablishmentsService } from './establishments/establishments';
 import { PrismaModule, PrismaService } from './prisma/prisma.service';
@@ -39,6 +40,7 @@ class HealthController {
 @Module({
   imports: [
     PrismaModule,
+    CatalogModule,
     JwtModule.register({}),
     // Limite globale par IP ; des limites plus strictes s'appliquent à la connexion.
     ThrottlerModule.forRoot({

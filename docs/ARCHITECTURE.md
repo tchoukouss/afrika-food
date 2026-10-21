@@ -60,3 +60,22 @@ prisma/
   bootstrap-data  initialisation idempotente (permissions, rôles, admin)
 test/             tests de bout en bout (vraie base PostgreSQL)
 ```
+
+## Module 2 — Catalogue
+
+Choix fonctionnels validés le 21/10/2026 :
+
+| Sujet | Règle |
+|---|---|
+| Marque | Portée par l'offre fournisseur et (module 3) par le lot. L'article reste « Farine T55 » : les recettes ne dépendent pas de la marque. |
+| Unités | Stock d'une matière en kg, L ou unité. Conditionnements (sac 25 kg…) et offres fournisseurs exprimés dans cette unité ; elle est verrouillée dès qu'ils existent. Prix au kg = prix du sac ÷ contenu. |
+| Prix de vente | TTC. Prix de base groupe + prix d'exception par établissement. Chaque changement ferme l'ancienne ligne (`valid_to`) et en ouvre une nouvelle : l'historique est complet, protégé par trigger (ni suppression, ni modification) et par un index unique partiel (un seul prix en vigueur par périmètre). |
+| TVA | Taux par produit (0 % par défaut), inclus dans le prix TTC. |
+| Types de produit | Fabriqué (recette au module 4), revendu (acheté chez un fournisseur), menu (composé d'autres produits, sans menu imbriqué). |
+| Droits | Catalogue (produits, matières, catégories) et prix de base : niveau groupe. Prix d'exception et disponibilité : dans l'établissement concerné. Fournisseurs : permission dans au moins un établissement (fichier commun, audité). |
+| Suppression | Aucune : archivage (`is_active`). |
+
+Migrations : générées par différence entre le schéma Prisma de la version
+précédente et le nouveau (`prisma migrate diff --from-schema-datamodel …`),
+complétées à la main par les contraintes que Prisma ne sait pas exprimer
+(CHECK, index partiels, triggers). Application avec `prisma migrate deploy`.

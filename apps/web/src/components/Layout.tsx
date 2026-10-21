@@ -1,4 +1,4 @@
-import { Building2, Home, KeyRound, LogOut, Menu, ScrollText, Settings, ShieldCheck, Users, X } from 'lucide-react';
+import { Building2, Croissant, Home, KeyRound, LogOut, Menu, ScrollText, Settings, ShieldCheck, Tags, Truck, Users, Wheat, X } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
@@ -14,6 +14,15 @@ interface NavItem {
 // Seuls les modules réellement développés apparaissent dans le menu.
 const NAV: { section: string; items: NavItem[] }[] = [
   { section: '', items: [{ to: '/', label: 'Accueil', icon: <Home className="size-4" /> }] },
+  {
+    section: 'Catalogue',
+    items: [
+      { to: '/produits', label: 'Produits', icon: <Croissant className="size-4" />, permission: 'products.view' },
+      { to: '/matieres', label: 'Matières premières', icon: <Wheat className="size-4" />, permission: 'products.view' },
+      { to: '/fournisseurs', label: 'Fournisseurs', icon: <Truck className="size-4" />, permission: 'suppliers.view' },
+      { to: '/categories', label: 'Catégories', icon: <Tags className="size-4" />, permission: 'products.view' },
+    ],
+  },
   {
     section: 'Administration',
     items: [

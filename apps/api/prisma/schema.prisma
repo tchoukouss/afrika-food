@@ -45,6 +45,13 @@ model Company {
   auditLogs      AuditLog[]
   sequences      DocumentSequence[]
 
+  // Module 2 — catalogue (relations uniquement, aucune colonne ajoutée)
+  rawMaterialCategories RawMaterialCategory[]
+  rawMaterials          RawMaterial[]
+  suppliers             Supplier[]
+  productCategories     ProductCategory[]
+  products              Product[]
+
   @@map("companies")
 }
 
@@ -68,6 +75,10 @@ model Establishment {
   company   Company    @relation(fields: [companyId], references: [id])
   userRoles UserRole[]
   auditLogs AuditLog[]
+
+  // Module 2 — catalogue (relations uniquement)
+  productPrices       ProductPrice[]
+  productAvailability ProductAvailability[]
 
   @@unique([companyId, code])
   @@map("establishments")
@@ -241,4 +252,267 @@ model DocumentSequence {
 
   @@id([companyId, scopeKey, docType, year])
   @@map("document_sequences")
+}
+
+// ===========================================================================
+// Module 2 — Catalogue : unités, matières premières, fournisseurs, produits.
+// Le catalogue est commun à tout le groupe ; les prix et la disponibilité
+// peuvent être ajustés par établissement.
+// Quantités : Decimal(18,4) exprimées dans l'unité de base de l'article.
+// Montants : FCFA entiers (BigInt), prix TTC.
+// ===========================================================================
+
+enum UnitDimension {
+  MASS
+  VOLUME
+  COUNT
+}
+
+// Unités de mesure (référentiel fixe, alimenté par la migration).
+// factor_to_base : 1 g = 0,001 kg ; 1 mL = 0,001 L ; 1 unité = 1 unité.
+model Unit {
+  code         String        @id
+  name         String
+  symbol       String
+  dimension    UnitDimension
+  factorToBase Decimal       @map("factor_to_base") @db.Decimal(18, 6)
+  isBase       Boolean       @map("is_base")
+
+  rawMaterials RawMaterial[]
+  products     Product[]
+
+  @@map("units")
+}
+
+enum RawMaterialKind {
+  INGREDIENT
+  PACKAGING
+  CONSUMABLE
+}
+
+model RawMaterialCategory {
+  id          String   @id @default(uuid()) @db.Uuid
+  companyId   String   @map("company_id") @db.Uuid
+  name        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company      Company       @relation(fields: [companyId], references: [id])
+  rawMaterials RawMaterial[]
+
+  @@unique([companyId, name])
+  @@map("raw_material_categories")
+}
+
+// Matière première (farine T55, sucre, beurre, emballages…).
+// La marque n'est PAS ici : elle est portée par l'offre fournisseur et par le lot.
+model RawMaterial {
+  id           String          @id @default(uuid()) @db.Uuid
+  companyId    String          @map("company_id") @db.Uuid
+  code         String
+  name         String
+  categoryId   String?         @map("category_id") @db.Uuid
+  kind         RawMaterialKind @default(INGREDIENT)
+  baseUnitCode String          @map("base_unit_code")
+  isPerishable Boolean         @default(false) @map("is_perishable")
+  trackLots    Boolean         @default(true) @map("track_lots")
+  description  String?
+  isActive     Boolean         @default(true) @map("is_active")
+  createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company          Company                @relation(fields: [companyId], references: [id])
+  category         RawMaterialCategory?   @relation(fields: [categoryId], references: [id])
+  baseUnit         Unit                   @relation(fields: [baseUnitCode], references: [code])
+  packagings       RawMaterialPackaging[]
+  supplierProducts SupplierProduct[]
+
+  @@unique([companyId, code])
+  @@index([companyId, name])
+  @@map("raw_materials")
+}
+
+// Conditionnement : « Sac 25 kg » = 25 (kg), « Plaquette 30 œufs » = 30 (unités).
+// Sert à afficher et compter le stock en sacs / cartons.
+model RawMaterialPackaging {
+  id            String   @id @default(uuid()) @db.Uuid
+  rawMaterialId String   @map("raw_material_id") @db.Uuid
+  name          String
+  quantity      Decimal  @db.Decimal(18, 4)
+  isDefault     Boolean  @default(false) @map("is_default")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  rawMaterial RawMaterial @relation(fields: [rawMaterialId], references: [id])
+
+  @@unique([rawMaterialId, name])
+  @@map("raw_material_packagings")
+}
+
+model Supplier {
+  id               String   @id @default(uuid()) @db.Uuid
+  companyId        String   @map("company_id") @db.Uuid
+  code             String
+  name             String
+  contactName      String?  @map("contact_name")
+  phone            String?
+  phone2           String?
+  email            String?
+  address          String?
+  city             String?
+  taxId            String?  @map("tax_id")
+  // Délai de paiement accordé par le fournisseur (jours) et conditions libres.
+  paymentTermsDays Int      @default(0) @map("payment_terms_days")
+  paymentTerms     String?  @map("payment_terms")
+  // Plafond de crédit accordé par le fournisseur, en FCFA (null = non défini).
+  creditLimit      BigInt?  @map("credit_limit")
+  notes            String?
+  isActive         Boolean  @default(true) @map("is_active")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company           @relation(fields: [companyId], references: [id])
+  products SupplierProduct[]
+
+  @@unique([companyId, code])
+  @@index([companyId, name])
+  @@map("suppliers")
+}
+
+// Offre d'un fournisseur pour un article : matière première OU produit revendu
+// (exactement l'un des deux, contrainte CHECK en base).
+// Ex. : Farine T55, marque X, « Sac 25 kg », 25 kg par sac, 18 500 FCFA le sac.
+model SupplierProduct {
+  id                      String    @id @default(uuid()) @db.Uuid
+  supplierId              String    @map("supplier_id") @db.Uuid
+  rawMaterialId           String?   @map("raw_material_id") @db.Uuid
+  productId               String?   @map("product_id") @db.Uuid
+  brand                   String?
+  supplierRef             String?   @map("supplier_ref")
+  purchaseUnitLabel       String    @map("purchase_unit_label")
+  quantityPerPurchaseUnit Decimal   @map("quantity_per_purchase_unit") @db.Decimal(18, 4)
+  // Prix de référence négocié par unité d'achat (le prix réel viendra des réceptions).
+  unitPrice               BigInt?   @map("unit_price")
+  priceUpdatedAt          DateTime? @map("price_updated_at") @db.Timestamptz(3)
+  isPreferred             Boolean   @default(false) @map("is_preferred")
+  isActive                Boolean   @default(true) @map("is_active")
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  supplier    Supplier     @relation(fields: [supplierId], references: [id])
+  rawMaterial RawMaterial? @relation(fields: [rawMaterialId], references: [id])
+  product     Product?     @relation(fields: [productId], references: [id])
+
+  @@index([supplierId])
+  @@index([rawMaterialId])
+  @@index([productId])
+  @@map("supplier_products")
+}
+
+enum ProductType {
+  MANUFACTURED // fabriqué (recette au module 4)
+  RESOLD // acheté et revendu tel quel
+  MENU // menu / formule composé d'autres produits
+}
+
+model ProductCategory {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @map("company_id") @db.Uuid
+  name      String
+  color     String?
+  sortOrder Int      @default(0) @map("sort_order")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company   @relation(fields: [companyId], references: [id])
+  products Product[]
+
+  @@unique([companyId, name])
+  @@map("product_categories")
+}
+
+model Product {
+  id           String      @id @default(uuid()) @db.Uuid
+  companyId    String      @map("company_id") @db.Uuid
+  code         String
+  name         String
+  categoryId   String?     @map("category_id") @db.Uuid
+  type         ProductType
+  saleUnitCode String      @default("U") @map("sale_unit_code")
+  barcode      String?
+  description  String?
+  imageUrl     String?     @map("image_url")
+  // Taux de TVA inclus dans le prix TTC (0 par défaut).
+  taxRate      Decimal     @default(0) @map("tax_rate") @db.Decimal(5, 2)
+  isActive     Boolean     @default(true) @map("is_active")
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company          Company               @relation(fields: [companyId], references: [id])
+  category         ProductCategory?      @relation(fields: [categoryId], references: [id])
+  saleUnit         Unit                  @relation(fields: [saleUnitCode], references: [code])
+  prices           ProductPrice[]
+  availability     ProductAvailability[]
+  supplierProducts SupplierProduct[]
+  menuComponents   ProductComponent[]    @relation("MenuComponents")
+  usedInMenus      ProductComponent[]    @relation("ComponentOf")
+
+  @@unique([companyId, code])
+  @@unique([companyId, barcode])
+  @@index([companyId, name])
+  @@map("products")
+}
+
+// Historique des prix de vente TTC.
+// establishment_id NULL = prix de base du groupe ; sinon prix spécifique au site.
+// Prix en vigueur = ligne avec valid_to NULL : une seule par produit et périmètre,
+// garantie par un index unique partiel (migration SQL). Un changement ferme
+// l'ancienne ligne et en ouvre une nouvelle : rien n'est jamais écrasé.
+model ProductPrice {
+  id              String    @id @default(uuid()) @db.Uuid
+  productId       String    @map("product_id") @db.Uuid
+  establishmentId String?   @map("establishment_id") @db.Uuid
+  price           BigInt
+  validFrom       DateTime  @default(now()) @map("valid_from") @db.Timestamptz(3)
+  validTo         DateTime? @map("valid_to") @db.Timestamptz(3)
+  createdById     String?   @map("created_by_id") @db.Uuid
+  reason          String?
+
+  product       Product        @relation(fields: [productId], references: [id])
+  establishment Establishment? @relation(fields: [establishmentId], references: [id])
+
+  @@index([productId, establishmentId, validTo])
+  @@map("product_prices")
+}
+
+// Disponibilité d'un produit dans un établissement (pas de ligne = disponible).
+model ProductAvailability {
+  productId       String   @map("product_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  isAvailable     Boolean  @map("is_available")
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  product       Product       @relation(fields: [productId], references: [id])
+  establishment Establishment @relation(fields: [establishmentId], references: [id])
+
+  @@id([productId, establishmentId])
+  @@map("product_availability")
+}
+
+// Composition d'un menu / d'une formule.
+model ProductComponent {
+  id                 String  @id @default(uuid()) @db.Uuid
+  menuProductId      String  @map("menu_product_id") @db.Uuid
+  componentProductId String  @map("component_product_id") @db.Uuid
+  quantity           Decimal @db.Decimal(18, 4)
+
+  menu      Product @relation("MenuComponents", fields: [menuProductId], references: [id])
+  component Product @relation("ComponentOf", fields: [componentProductId], references: [id])
+
+  @@unique([menuProductId, componentProductId])
+  @@map("product_components")
 }
