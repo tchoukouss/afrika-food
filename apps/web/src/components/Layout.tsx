@@ -3,6 +3,7 @@ import {
   Boxes,
   Building2,
   ClipboardCheck,
+  ClipboardList,
   Croissant,
   Home,
   KeyRound,
@@ -47,6 +48,7 @@ const NAV: { section: string; items: NavItem[] }[] = [
     section: 'Achats & stock',
     items: [
       { to: '/stock', label: 'Stock', icon: <Boxes className="size-4" />, permission: 'stock.view' },
+      { to: '/demandes-achat', label: 'Demandes d’achat', icon: <ClipboardList className="size-4" />, permission: 'stock.view' },
       { to: '/achats', label: 'Achats', icon: <ShoppingCart className="size-4" />, permission: 'purchases.view' },
       { to: '/factures-fournisseurs', label: 'Factures fournisseurs', icon: <Receipt className="size-4" />, permission: 'purchases.view' },
       { to: '/inventaires', label: 'Inventaires', icon: <ClipboardCheck className="size-4" />, permission: 'stock.view' },

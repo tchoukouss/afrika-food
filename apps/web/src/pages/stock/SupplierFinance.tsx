@@ -5,7 +5,7 @@ import { Alert, Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Sp
 import { api, ApiError } from '../../lib/api';
 import { formatDate, formatDateTime, formatXOF } from '../../lib/format';
 import { INVOICE_STATUS, PAYMENT_METHODS } from '../../lib/stock-types';
-import { RequireEstablishment, StatusBadge, Tabs, useEstablishment, useReasonDialog, useRequestId, useSuppliers } from './shared';
+import { RequireEstablishment, RequirePermission, StatusBadge, Tabs, useEstablishment, useReasonDialog, useRequestId, useSuppliers } from './shared';
 
 const invalidate = (qc: ReturnType<typeof useQueryClient>) =>
   Promise.all(['supplier-invoices', 'supplier-payments', 'supplier-account', 'goods-receipts'].map((k) => qc.invalidateQueries({ queryKey: [k] })));
@@ -504,11 +504,13 @@ export function SupplierFinancePage() {
           { id: 'accounts', label: 'Comptes fournisseurs' },
         ]}
       />
+      <RequirePermission permission="purchases.view">
       {tab === 'accounts' ? (
         <AccountsTab />
       ) : (
         <RequireEstablishment>{(establishmentId) => (tab === 'invoices' ? <InvoicesTab establishmentId={establishmentId} /> : <PaymentsTab establishmentId={establishmentId} />)}</RequireEstablishment>
       )}
+      </RequirePermission>
     </>
   );
 }

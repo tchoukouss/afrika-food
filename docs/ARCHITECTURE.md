@@ -116,3 +116,30 @@ même envoi ne crée qu'un document ; les envois suivants, même simultanés,
 reçoivent le document déjà créé. Un identifiant ne peut être rejoué que par
 l'utilisateur qui l'a émis. Les changements de statut (valider, expédier,
 recevoir…) sont protégés par leur contrôle de statut (409 au second envoi).
+
+### Droits du module 3 par rôle (validés le 21/10/2026)
+
+Les rôles par défaut sont définis dans le module 1 et ne sont pas modifiés ;
+la répartition ci-dessous découle des permissions qu'ils détiennent et des
+règles du module 3. Un administrateur peut ajuster les rôles depuis l'écran
+« Rôles & permissions ».
+
+| Action | Permission exigée | Rôles par défaut |
+|---|---|---|
+| Voir stock, lots, mouvements, pertes, inventaires, transferts | stock.view | Admin, Directeur, Responsable, Resp. achats, Magasinier, Resp. production, Chef de cuisine |
+| Créer une demande d'achat (voir/annuler les siennes) | stock.view | idem |
+| Voir toutes les demandes, commandes, réceptions, retours, factures, paiements, comptes fournisseurs | purchases.view | Admin, Directeur, Responsable, Resp. achats, Magasinier, Comptable |
+| Refuser une demande ; créer, modifier, valider, annuler, clôturer une commande | purchases.manage | Admin, Directeur, Responsable, Resp. achats |
+| Réceptionner (avec ou sans commande) ; retour fournisseur | purchases.receive | Admin, Directeur, Responsable, Resp. achats, Magasinier |
+| Factures fournisseurs, paiements, avances, annulations | supplier_payments.manage | Admin, Directeur, Resp. achats, Comptable |
+| Déclarer une perte | stock.adjust OU production.manage | Admin, Directeur, Responsable, Magasinier, Resp. production, Chef de cuisine |
+| Demander une correction ; déplacer entre emplacements ; emplacements ; seuils | stock.adjust | Admin, Directeur, Responsable, Magasinier, Resp. production |
+| Valider / refuser une correction | inventory.validate | Admin, Directeur, Responsable |
+| Ouvrir un inventaire, compter | inventory.manage | Admin, Directeur, Responsable, Magasinier |
+| Valider / annuler un inventaire | inventory.validate | Admin, Directeur, Responsable |
+| Demander un transfert (destination), préparer, expédier (source), réceptionner (destination), clôturer, annuler | stock.transfer | Admin, Directeur, Responsable, Magasinier |
+| Valider un transfert (source) | stock.transfer ET inventory.validate | Admin, Directeur, Responsable |
+
+Serveur, Caissier, Livreur : aucun accès au module 3.
+Chaque permission s'apprécie dans l'établissement concerné (rôle attribué
+au site) ou au niveau groupe (rôle sans établissement).

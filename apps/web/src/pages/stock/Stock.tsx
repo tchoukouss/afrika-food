@@ -6,7 +6,7 @@ import { api, ApiError } from '../../lib/api';
 import { qty } from '../../lib/catalog-types';
 import { formatDate, formatDateTime, formatXOF } from '../../lib/format';
 import { LOSS_CAUSES, LotRow, Movement, MOVEMENT_TYPES, StockLocation, StockRow, unitLabel } from '../../lib/stock-types';
-import { itemPayload, ItemSelect, LocationSelect, PickableItem, RequireEstablishment, Tabs, useEstablishment, useLocations, useRequestId, useStockItems } from './shared';
+import { itemPayload, ItemSelect, LocationSelect, PickableItem, RequireEstablishment, RequirePermission, Tabs, useCanDeclareLoss, useEstablishment, useLocations, useRequestId, useStockItems } from './shared';
 
 interface PurchasePrice {
   receiptId: string;
@@ -240,6 +240,7 @@ function ItemDetail({ establishmentId, row }: { establishmentId: string; row: St
   const unit = unitLabel(row.item?.unit);
   const preset: PickableItem = { key: '', rawMaterialId: row.rawMaterialId, productId: row.productId, code: row.item?.code ?? '', name: row.item?.name ?? '', unit: row.item?.unit ?? '', isPerishable: false };
   const canAdjust = can('stock.adjust');
+  const canLoss = useCanDeclareLoss();
 
   return (
     <div className="space-y-5">
@@ -275,17 +276,23 @@ function ItemDetail({ establishmentId, row }: { establishmentId: string; row: St
         </div>
       </div>
 
-      {canAdjust && (
+      {(canLoss || canAdjust) && (
         <div className="flex flex-wrap gap-2">
-          <Button variant="danger" onClick={() => (setLossLot(undefined), setAction('loss'))}>
-            Déclarer une perte
-          </Button>
-          <Button variant="secondary" onClick={() => setAction('adjust')}>
-            Demander une correction
-          </Button>
-          <Button variant="secondary" onClick={() => setAction('move')}>
-            Déplacer
-          </Button>
+          {canLoss && (
+            <Button variant="danger" onClick={() => (setLossLot(undefined), setAction('loss'))}>
+              Déclarer une perte
+            </Button>
+          )}
+          {canAdjust && (
+            <>
+              <Button variant="secondary" onClick={() => setAction('adjust')}>
+                Demander une correction
+              </Button>
+              <Button variant="secondary" onClick={() => setAction('move')}>
+                Déplacer
+              </Button>
+            </>
+          )}
         </div>
       )}
       {action && (
@@ -321,7 +328,7 @@ function ItemDetail({ establishmentId, row }: { establishmentId: string; row: St
                   {qty(l.quantity)} {unit}
                 </Td>
                 <Td>
-                  {l.isExpired && canAdjust && (
+                  {l.isExpired && canLoss && (
                     <Button variant="ghost" onClick={() => (setLossLot(l.lotId), setAction('loss'))}>
                       Sortir (péremption)
                     </Button>
@@ -512,7 +519,7 @@ interface LossRecord {
 }
 
 function LossesTab({ establishmentId }: { establishmentId: string }) {
-  const { can } = useEstablishment();
+  const canLoss = useCanDeclareLoss();
   const [creating, setCreating] = useState(false);
   const { data, isLoading } = useQuery({ queryKey: ['stock-losses', establishmentId], queryFn: () => api.get<LossRecord[]>(`/stock-losses?establishmentId=${establishmentId}`) });
   const total = (data ?? []).reduce((s, l) => s + Number(l.estimatedValue), 0);
@@ -520,7 +527,7 @@ function LossesTab({ establishmentId }: { establishmentId: string }) {
     <Card
       title={`Pertes — ${formatXOF(total)}`}
       actions={
-        can('stock.adjust') && (
+        canLoss && (
           <Button variant="danger" onClick={() => setCreating(true)}>
             <Plus className="size-4" /> Déclarer une perte
           </Button>
@@ -698,7 +705,7 @@ export function StockPage() {
       <PageHeader title="Stock" subtitle={establishment ? `${establishment.name} — lots, valeur, pertes et corrections` : undefined} />
       <RequireEstablishment>
         {(establishmentId) => (
-          <>
+          <RequirePermission permission="stock.view">
             <Tabs<Tab>
               value={tab}
               onChange={setTab}
@@ -715,7 +722,7 @@ export function StockPage() {
             {tab === 'losses' && <LossesTab establishmentId={establishmentId} />}
             {tab === 'adjustments' && <AdjustmentsTab establishmentId={establishmentId} />}
             {tab === 'locations' && <LocationsTab establishmentId={establishmentId} />}
-          </>
+          </RequirePermission>
         )}
       </RequireEstablishment>
     </>

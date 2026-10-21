@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Injectable, NotFoundException, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { AdjustmentDirection, AdjustmentStatus, LossCause } from '@prisma/client';
 import { Transform } from 'class-transformer';
@@ -102,7 +102,11 @@ export class StockOperationsService {
     const item = itemOf(dto);
     if (dto.cause === 'TRANSIT') throw new BadRequestException('Les pertes en transit sont enregistrées à la réception du transfert');
     return this.prisma.$transaction(async (tx) => {
-      const est = await establishmentFor(tx, me, dto.establishmentId, 'stock.adjust');
+      // Pertes : magasin (« Ajuster le stock ») ou production (« Lancer / clôturer une production »).
+      const est = await establishmentFor(tx, me, dto.establishmentId, 'stock.view');
+      if (!me.access.can('stock.adjust', est.id) && !me.access.can('production.manage', est.id)) {
+        throw new ForbiddenException("Vous n'avez pas la permission de déclarer une perte dans cet établissement");
+      }
       const info = await loadItem(tx, me.companyId, item);
       const location = await this.engine.resolveLocation(tx, me.companyId, est.id, dto.locationId);
       const number = await nextNumber(tx, me.companyId, 'STOCK_LOSS', est);
@@ -319,7 +323,8 @@ export class StockOperationsController {
   }
 
   @Post('stock-losses')
-  @RequirePermissions('stock.adjust')
+  // « Ajuster le stock » OU « Lancer / clôturer une production » : vérifié par le service.
+  @RequirePermissions('stock.view')
   @AnyEstablishmentScope()
   declareLoss(@CurrentUser() me: AuthUser, @Body() dto: LossDto) {
     return this.service.declareLoss(me, dto);

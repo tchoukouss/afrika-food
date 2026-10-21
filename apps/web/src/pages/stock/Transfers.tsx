@@ -7,7 +7,7 @@ import { useAuth } from '../../lib/auth';
 import { qty } from '../../lib/catalog-types';
 import { formatDateTime, formatXOF } from '../../lib/format';
 import { TRANSFER_STATUS, unitLabel } from '../../lib/stock-types';
-import { itemPayload, ItemSelect, LocationSelect, PickableItem, RequireEstablishment, StatusBadge, useEstablishment, useReasonDialog, useRequestId, useStockItems } from './shared';
+import { itemPayload, ItemSelect, LocationSelect, PickableItem, RequireEstablishment, RequirePermission, StatusBadge, useEstablishment, useReasonDialog, useRequestId, useStockItems } from './shared';
 
 interface TransferItem {
   id: string;
@@ -133,7 +133,7 @@ function TransferDetail({ id }: { id: string }) {
     onSuccess: () => invalidate(qc),
   });
   if (isLoading || !t) return <Spinner />;
-  const canAt = (estId: string) => !!me?.establishments.find((e) => e.id === estId)?.permissions.includes('stock.transfer');
+  const canAt = (estId: string, p = 'stock.transfer') => !!me?.establishments.find((e) => e.id === estId)?.permissions.includes(p);
   const atSource = canAt(t.sourceEstablishmentId);
   const atDest = canAt(t.destEstablishmentId);
   const items = t.items ?? [];
@@ -154,7 +154,7 @@ function TransferDetail({ id }: { id: string }) {
           {t.cancelReason && <div className="text-xs text-stone-500">Motif : {t.cancelReason}</div>}
         </div>
         <div className="flex flex-wrap gap-2">
-          {t.status === 'REQUESTED' && atSource && (
+          {t.status === 'REQUESTED' && atSource && canAt(t.sourceEstablishmentId, 'inventory.validate') && (
             <Button loading={act.isPending} onClick={() => act.mutate({ action: 'validate' })}>
               Valider
             </Button>
@@ -286,6 +286,7 @@ export function TransfersPage() {
       <PageHeader title="Transferts entre établissements" subtitle={establishment ? establishment.name : undefined} />
       <RequireEstablishment>
         {(establishmentId) => (
+          <RequirePermission permission="stock.view">
           <TransferList establishmentId={establishmentId} estName={estName} onOpen={setOpenId}>
             {can('stock.transfer') && (
               <Button onClick={() => setCreating(true)}>
@@ -304,6 +305,7 @@ export function TransfersPage() {
               )}
             </Modal>
           </TransferList>
+          </RequirePermission>
         )}
       </RequireEstablishment>
       <Modal open={!!openId} onClose={() => setOpenId(null)} title="Transfert" wide>

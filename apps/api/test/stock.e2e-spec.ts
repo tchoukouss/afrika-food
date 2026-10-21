@@ -24,6 +24,7 @@ describe('Module 3 — Achats & stock', () => {
   let soc: string; // fournisseur sucre
   let offerFarine: string;
   let principalPlt: string;
+  let roles: Record<string, string>;
   let froidPlt: string;
 
   const stockOf = async (s: Session, est: string, itemId: string) => {
@@ -40,7 +41,7 @@ describe('Module 3 — Achats & stock', () => {
     ({ app, prisma } = await createTestApp());
     await resetDatabase(prisma);
     admin = await login(app, ADMIN_EMAIL, ADMIN_PASSWORD);
-    const roles = Object.fromEntries((await api(app, admin).get('/api/roles').expect(200)).body.map((r: { code: string; id: string }) => [r.code, r.id]));
+    roles = Object.fromEntries((await api(app, admin).get('/api/roles').expect(200)).body.map((r: { code: string; id: string }) => [r.code, r.id]));
     plateau = (await api(app, admin).post('/api/establishments').send({ code: 'PLT', name: 'Pâtisserie Plateau', type: 'PATISSERIE' }).expect(201)).body.id;
     yopougon = (await api(app, admin).post('/api/establishments').send({ code: 'YOP', name: 'Restaurant Yopougon', type: 'RESTAURANT' }).expect(201)).body.id;
     manager = await createAndLogin(app, admin, { email: 'resp@test.ci', fullName: 'Resp Plateau', roles: [{ roleId: roles.MANAGER, establishmentId: plateau }] });
@@ -317,6 +318,8 @@ describe('Module 3 — Achats & stock', () => {
       transfer = (await api(app, yopKeeper, yopougon).post('/api/stock-transfers').send({ sourceEstablishmentId: plateau, destEstablishmentId: yopougon, items: [{ rawMaterialId: farine, quantity: 200 }] }).expect(201)).body;
       // La validation revient à l'établissement source.
       await api(app, yopKeeper, yopougon).post(`/api/stock-transfers/${transfer.id}/validate`).expect(403);
+      // Le magasinier de la source prépare et expédie, mais ne valide pas.
+      await api(app, storekeeper, plateau).post(`/api/stock-transfers/${transfer.id}/validate`).expect(403);
       await api(app, manager, plateau).post(`/api/stock-transfers/${transfer.id}/validate`).expect(201);
       await api(app, storekeeper, plateau).post(`/api/stock-transfers/${transfer.id}/ship`).expect(409); // pas encore préparé
       await api(app, storekeeper, plateau).post(`/api/stock-transfers/${transfer.id}/prepare`).send({ sourceLocationId: principalPlt, items: [{ itemId: transfer.items[0].id, quantity: 200 }] }).expect(201);
@@ -494,6 +497,78 @@ describe('Module 3 — Achats & stock', () => {
       expect(res.body.purchaseHistory.every((r: { invoice: string | null; purchaseOrder: { number: string } }) => r.invoice && r.purchaseOrder.number)).toBe(true);
       expect(res.body.returns).toHaveLength(1);
       expect(res.body.returns[0].creditNote.number).toMatch(/^PLT-AVF-/);
+    });
+  });
+
+  describe('Droits par rôle', () => {
+    let chef: Session & { id: string }; // Chef de cuisine, Plateau
+    let prod: Session & { id: string }; // Responsable production, Plateau
+    let accountant: Session & { id: string }; // Comptable, Plateau
+    let waiter: Session & { id: string }; // Serveur, Plateau
+    const request = { establishmentId: '', items: [] as { rawMaterialId: string; quantity: number }[] };
+
+    beforeAll(async () => {
+      chef = await createAndLogin(app, admin, { email: 'chef@test.ci', fullName: 'Chef cuisine', roles: [{ roleId: roles.HEAD_CHEF, establishmentId: plateau }] });
+      prod = await createAndLogin(app, admin, { email: 'prod@test.ci', fullName: 'Resp production', roles: [{ roleId: roles.PRODUCTION_MANAGER, establishmentId: plateau }] });
+      accountant = await createAndLogin(app, admin, { email: 'compta@test.ci', fullName: 'Comptable', roles: [{ roleId: roles.ACCOUNTANT, establishmentId: plateau }] });
+      waiter = await createAndLogin(app, admin, { email: 'serveur@test.ci', fullName: 'Serveur', roles: [{ roleId: roles.WAITER, establishmentId: plateau }] });
+      Object.assign(request, { establishmentId: plateau, items: [{ rawMaterialId: sucre, quantity: 25 }] });
+    });
+
+    it('demandes d’achat : ceux qui voient le stock en créent, chacun ne voit que les siennes sauf les achats', async () => {
+      const mine = await api(app, chef, plateau).post('/api/purchase-requests').send(request).expect(201);
+      await api(app, prod, plateau).post('/api/purchase-requests').send(request).expect(201);
+      await api(app, accountant, plateau).post('/api/purchase-requests').send(request).expect(403);
+      await api(app, waiter, plateau).post('/api/purchase-requests').send(request).expect(403);
+
+      const chefList = await api(app, chef, plateau).get('/api/purchase-requests').expect(200);
+      expect(chefList.body.map((r: Id) => r.id)).toEqual([mine.body.id]);
+      const buyerList = await api(app, purchaser, plateau).get('/api/purchase-requests').expect(200);
+      expect(buyerList.body.length).toBeGreaterThan(2);
+      await api(app, accountant, plateau).get('/api/purchase-requests').expect(200); // consultation via « Voir les achats »
+      await api(app, waiter, plateau).get('/api/purchase-requests').expect(403);
+
+      // Le chef annule sa demande mais ne peut pas refuser ; il ne touche pas aux demandes des autres.
+      const other = buyerList.body.find((r: { requestedById: string; status: string }) => r.requestedById !== chef.id && r.status === 'OPEN');
+      await api(app, chef, plateau).post(`/api/purchase-requests/${other.id}/cancel`).send({ reason: 'pas à moi' }).expect(403);
+      await api(app, chef, plateau).post(`/api/purchase-requests/${mine.body.id}/reject`).send({ reason: 'interdit' }).expect(403);
+      await api(app, chef, plateau).post(`/api/purchase-requests/${mine.body.id}/cancel`).send({ reason: 'Erreur de quantité' }).expect(201);
+    });
+
+    it('pertes : magasin et production (chef compris) ; corrections et déplacements : magasin seulement', async () => {
+      const loss = { establishmentId: plateau, locationId: froidPlt, rawMaterialId: sucre, quantity: 1, cause: 'BURNT', comment: 'Caramel brûlé' };
+      await api(app, chef, plateau).post('/api/stock-losses').send(loss).expect(201);
+      await api(app, prod, plateau).post('/api/stock-losses').send(loss).expect(201);
+      await api(app, purchaser, plateau).post('/api/stock-losses').send(loss).expect(403);
+      await api(app, accountant, plateau).post('/api/stock-losses').send(loss).expect(403);
+      await api(app, waiter, plateau).post('/api/stock-losses').send(loss).expect(403);
+      await api(app, chef, plateau).post('/api/stock-adjustments').send({ establishmentId: plateau, rawMaterialId: sucre, direction: 'OUT', quantity: 1, reason: 'test droits' }).expect(403);
+      await api(app, chef, plateau).post('/api/location-moves').send({ establishmentId: plateau, rawMaterialId: sucre, fromLocationId: froidPlt, toLocationId: principalPlt, quantity: 1 }).expect(403);
+      await api(app, prod, plateau).post('/api/stock-adjustments').send({ establishmentId: plateau, rawMaterialId: sucre, direction: 'OUT', quantity: 1, reason: 'test droits' }).expect(201);
+    });
+
+    it('achats, réceptions, inventaires et paiements restent aux rôles prévus', async () => {
+      // Chef et responsable production : pas d'accès aux commandes ni aux réceptions.
+      for (const s of [chef, prod]) {
+        await api(app, s, plateau).get('/api/purchase-orders').expect(403);
+        await api(app, s, plateau).post('/api/goods-receipts').send({ establishmentId: plateau, supplierId: soc, items: [] }).expect(403);
+        await api(app, s, plateau).post('/api/inventories').send({ establishmentId: plateau }).expect(403);
+      }
+      // Responsable achats : pas d'inventaire ni de transfert.
+      await api(app, purchaser, plateau).post('/api/inventories').send({ establishmentId: plateau }).expect(403);
+      await api(app, purchaser, plateau).post('/api/stock-transfers').send({ sourceEstablishmentId: yopougon, destEstablishmentId: plateau, items: [{ rawMaterialId: sucre, quantity: 1 }] }).expect(403);
+      // Paiements fournisseurs : séparation des tâches.
+      const pay = { establishmentId: plateau, supplierId: soc, amount: 1000, method: 'CASH' };
+      await api(app, manager, plateau).post('/api/supplier-payments').send(pay).expect(403);
+      await api(app, storekeeper, plateau).post('/api/supplier-payments').send(pay).expect(403);
+      await api(app, accountant, plateau).post('/api/supplier-payments').send(pay).expect(201);
+      // Le comptable consulte les achats mais ne voit pas le stock.
+      await api(app, accountant, plateau).get('/api/goods-receipts').expect(200);
+      await api(app, accountant, plateau).get('/api/stock/items').expect(403);
+      // Le serveur n'a aucun accès au stock ni aux achats.
+      for (const url of ['/api/stock/items', '/api/stock-losses', '/api/purchase-orders', '/api/supplier-invoices', '/api/inventories', '/api/stock-transfers']) {
+        await api(app, waiter, plateau).get(url).expect(403);
+      }
     });
   });
 

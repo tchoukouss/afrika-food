@@ -13,7 +13,7 @@ import { ProductsPage } from './pages/catalog/Products';
 import { RawMaterialsPage } from './pages/catalog/RawMaterials';
 import { SuppliersPage } from './pages/catalog/Suppliers';
 import { InventoryPage } from './pages/stock/Inventory';
-import { PurchasesPage } from './pages/stock/Purchases';
+import { PurchaseRequestsPage, PurchasesPage } from './pages/stock/Purchases';
 import { StockPage } from './pages/stock/Stock';
 import { SupplierFinancePage } from './pages/stock/SupplierFinance';
 import { TransfersPage } from './pages/stock/Transfers';
@@ -58,6 +58,7 @@ function App() {
         <Route path="categories" element={<CategoriesPage />} />
         <Route path="stock" element={<StockPage />} />
         <Route path="achats" element={<PurchasesPage />} />
+        <Route path="demandes-achat" element={<PurchaseRequestsPage />} />
         <Route path="factures-fournisseurs" element={<SupplierFinancePage />} />
         <Route path="inventaires" element={<InventoryPage />} />
         <Route path="transferts" element={<TransfersPage />} />

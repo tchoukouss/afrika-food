@@ -167,3 +167,28 @@ export function useRequestId() {
   const [id] = useState(uuid);
   return id;
 }
+
+/**
+ * Protection d'écran : si l'utilisateur arrive sur la page (lien direct, autre
+ * établissement sélectionné…) sans la permission, un message remplace le contenu.
+ * Le serveur reste seul juge : cette protection évite seulement un écran d'erreurs.
+ */
+export function RequirePermission({ permission, children }: { permission: string | string[]; children: ReactNode }) {
+  const { establishmentId, can, canAnywhere } = useAuth();
+  const list = Array.isArray(permission) ? permission : [permission];
+  const allowed = list.some((p) => (establishmentId ? can(p) : canAnywhere(p)));
+  if (!allowed) {
+    return (
+      <Card>
+        <Alert>Accès refusé : votre rôle ne donne pas accès à cet écran{establishmentId ? ' dans cet établissement' : ''}.</Alert>
+      </Card>
+    );
+  }
+  return <>{children}</>;
+}
+
+/** Peut déclarer une perte : magasin (« Ajuster le stock ») ou production. */
+export function useCanDeclareLoss() {
+  const { can } = useAuth();
+  return can('stock.adjust') || can('production.manage');
+}

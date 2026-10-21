@@ -111,9 +111,22 @@ export class PurchasesService {
 
   // Demandes d'achat ---------------------------------------------------------
 
+  /**
+   * Demandes visibles : toutes celles des établissements où l'on voit les achats ;
+   * ailleurs (où l'on voit seulement le stock), uniquement ses propres demandes.
+   */
   async listRequests(me: AuthUser, q: RequestQuery) {
+    const all = readableEstablishments(me, 'purchases.view');
+    const own = readableEstablishments(me, 'stock.view').filter((id) => !all.includes(id));
+    const keep = (ids: string[]) => (q.establishmentId ? ids.filter((id) => id === q.establishmentId) : ids);
+    if (q.establishmentId && !keep([...all, ...own]).length) throw new ForbiddenException('Établissement non accessible');
+    if (!all.length && !own.length) throw new ForbiddenException("Vous n'avez pas la permission de consulter les demandes d'achat");
     const rows = await this.prisma.purchaseRequest.findMany({
-      where: { companyId: me.companyId, establishmentId: { in: this.scope(me, q.establishmentId) }, status: q.status },
+      where: {
+        companyId: me.companyId,
+        status: q.status,
+        OR: [{ establishmentId: { in: keep(all) } }, { establishmentId: { in: keep(own) }, requestedById: me.userId }],
+      },
       orderBy: { createdAt: 'desc' },
       include: { items: true, purchaseOrder: { select: { id: true, number: true } } },
       take: 200,
@@ -144,7 +157,8 @@ export class PurchasesService {
 
   private doCreateRequest(me: AuthUser, dto: CreateRequestDto) {
     return this.prisma.$transaction(async (tx) => {
-      const est = await establishmentFor(tx, me, dto.establishmentId, 'purchases.view');
+      // Toute personne qui voit le stock de l'établissement peut signaler un besoin.
+      const est = await establishmentFor(tx, me, dto.establishmentId, 'stock.view');
       for (const i of dto.items) {
         const info = await loadItem(tx, me.companyId, itemOf(i), { purchasable: true });
         if (!info.isActive) throw new BadRequestException(`« ${info.name} » est archivé`);
@@ -175,7 +189,8 @@ export class PurchasesService {
       if (r.status !== 'OPEN') throw new ConflictException('Cette demande a déjà été traitée');
       // Refus : par les achats. Annulation : par son auteur ou par les achats.
       const isBuyer = me.access.can('purchases.manage', r.establishmentId);
-      if (action === 'reject' ? !isBuyer : !(isBuyer || r.requestedById === me.userId)) {
+      const isAuthor = r.requestedById === me.userId && me.access.can('stock.view', r.establishmentId);
+      if (action === 'reject' ? !isBuyer : !(isBuyer || isAuthor)) {
         throw new ForbiddenException("Vous n'avez pas la permission de traiter cette demande");
       }
       const updated = await tx.purchaseRequest.update({
@@ -431,15 +446,16 @@ export class PurchasesService {
 export class PurchasesController {
   constructor(private readonly service: PurchasesService) {}
 
+  // Accès « purchases.view » (toutes les demandes) OU « stock.view » (ses demandes) :
+  // le contrôle « l'un ou l'autre » est fait par le service.
   @Get('purchase-requests')
-  @RequirePermissions('purchases.view')
-  @AnyEstablishmentScope()
   listRequests(@CurrentUser() me: AuthUser, @Query() q: RequestQuery) {
     return this.service.listRequests(me, q);
   }
 
+  // Quiconque voit le stock peut signaler un besoin d'achat.
   @Post('purchase-requests')
-  @RequirePermissions('purchases.view')
+  @RequirePermissions('stock.view')
   @AnyEstablishmentScope()
   createRequest(@CurrentUser() me: AuthUser, @Body() dto: CreateRequestDto) {
     return this.service.createRequest(me, dto);
@@ -452,8 +468,9 @@ export class PurchasesController {
     return this.service.decideRequest(me, id, 'reject', dto);
   }
 
+  // Annulation : par son auteur ou par les achats (vérifié par le service).
   @Post('purchase-requests/:id/cancel')
-  @RequirePermissions('purchases.view')
+  @RequirePermissions('stock.view')
   @AnyEstablishmentScope()
   cancelRequest(@CurrentUser() me: AuthUser, @Param('id', ParseUUIDPipe) id: string, @Body() dto: DecisionDto) {
     return this.service.decideRequest(me, id, 'cancel', dto);

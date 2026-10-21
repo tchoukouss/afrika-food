@@ -6,7 +6,7 @@ import { api, ApiError } from '../../lib/api';
 import { qty } from '../../lib/catalog-types';
 import { formatDateTime, formatXOF } from '../../lib/format';
 import { unitLabel } from '../../lib/stock-types';
-import { ItemSelect, itemPayload, LocationSelect, PickableItem, RequireEstablishment, useEstablishment, useReasonDialog, useStockItems } from './shared';
+import { itemPayload, ItemSelect, LocationSelect, PickableItem, RequireEstablishment, RequirePermission, useEstablishment, useReasonDialog, useStockItems } from './shared';
 
 interface InventoryLine {
   id: string;
@@ -177,6 +177,7 @@ export function InventoryPage() {
       <PageHeader title="Inventaires" subtitle={establishment ? establishment.name : undefined} />
       <RequireEstablishment>
         {(establishmentId) => (
+          <RequirePermission permission="stock.view">
           <InventoryList
             establishmentId={establishmentId}
             onOpen={setOpenId}
@@ -201,6 +202,7 @@ export function InventoryPage() {
               />
             </Modal>
           </InventoryList>
+          </RequirePermission>
         )}
       </RequireEstablishment>
       <Modal open={!!openId} onClose={() => setOpenId(null)} title="Feuille d’inventaire" wide>

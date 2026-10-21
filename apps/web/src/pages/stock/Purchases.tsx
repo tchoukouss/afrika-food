@@ -3,10 +3,11 @@ import { Plus, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Alert, Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Table, Td } from '../../components/ui';
 import { api, ApiError } from '../../lib/api';
+import { useAuth } from '../../lib/auth';
 import { qty, Supplier, SupplierOffer } from '../../lib/catalog-types';
 import { formatDate, formatDateTime, formatXOF } from '../../lib/format';
 import { LotRow, PO_STATUS, REQUEST_STATUS, unitLabel } from '../../lib/stock-types';
-import { itemPayload, ItemSelect, LocationSelect, PickableItem, RequireEstablishment, StatusBadge, Tabs, useEstablishment, useReasonDialog, useRequestId, useStockItems, useSuppliers } from './shared';
+import { itemPayload, ItemSelect, LocationSelect, PickableItem, RequireEstablishment, RequirePermission, StatusBadge, Tabs, useEstablishment, useReasonDialog, useRequestId, useStockItems, useSuppliers } from './shared';
 
 const invalidate = (qc: ReturnType<typeof useQueryClient>) =>
   Promise.all(['purchase-requests', 'purchase-orders', 'goods-receipts', 'supplier-returns', 'stock', 'supplier-invoices', 'supplier-account'].map((k) => qc.invalidateQueries({ queryKey: [k] })));
@@ -19,6 +20,7 @@ interface RequestRec {
   notes: string | null;
   createdAt: string;
   requestedBy: string | null;
+  requestedById: string;
   decisionNote: string | null;
   purchaseOrder: { id: string; number: string } | null;
   items: { id: string; quantity: string; note: string | null; item: { name: string; unit: string } | null }[];
@@ -119,6 +121,7 @@ function RequestForm({ establishmentId, onDone }: { establishmentId: string; onD
 function RequestsTab({ establishmentId }: { establishmentId: string }) {
   const qc = useQueryClient();
   const { can } = useEstablishment();
+  const { me } = useAuth();
   const [creating, setCreating] = useState(false);
   const { data, isLoading } = useQuery({ queryKey: ['purchase-requests', establishmentId], queryFn: () => api.get<RequestRec[]>(`/purchase-requests?establishmentId=${establishmentId}`) });
   const reason = useReasonDialog();
@@ -132,7 +135,7 @@ function RequestsTab({ establishmentId }: { establishmentId: string }) {
     <Card
       title="Demandes d’achat"
       actions={
-        can('purchases.view') && (
+        can('stock.view') && (
           <Button onClick={() => setCreating(true)}>
             <Plus className="size-4" /> Nouvelle demande
           </Button>
@@ -170,9 +173,11 @@ function RequestsTab({ establishmentId }: { establishmentId: string }) {
                         Refuser
                       </Button>
                     )}
-                    <Button variant="ghost" onClick={() => ask(r.id, 'cancel')}>
-                      Annuler
-                    </Button>
+                    {(can('purchases.manage') || r.requestedById === me?.id) && (
+                      <Button variant="ghost" onClick={() => ask(r.id, 'cancel')}>
+                        Annuler
+                      </Button>
+                    )}
                   </>
                 )}
               </Td>
@@ -934,14 +939,14 @@ function ReturnsTab({ establishmentId }: { establishmentId: string }) {
   );
 }
 
-type Tab = 'requests' | 'orders' | 'receipts' | 'returns';
+type Tab = 'orders' | 'receipts' | 'returns';
 
+/** Achats : commandes, réceptions et retours (permission « Voir les achats »). */
 export function PurchasesPage() {
   const { establishment } = useEstablishment();
   const [tab, setTab] = useState<Tab>('orders');
   const tabs = useMemo(
     () => [
-      { id: 'requests' as const, label: 'Demandes' },
       { id: 'orders' as const, label: 'Commandes' },
       { id: 'receipts' as const, label: 'Réceptions' },
       { id: 'returns' as const, label: 'Retours' },
@@ -950,16 +955,35 @@ export function PurchasesPage() {
   );
   return (
     <>
-      <PageHeader title="Achats" subtitle={establishment ? `${establishment.name} — demandes, commandes, réceptions et retours` : undefined} />
+      <PageHeader title="Achats" subtitle={establishment ? `${establishment.name} — commandes, réceptions et retours` : undefined} />
       <RequireEstablishment>
         {(establishmentId) => (
-          <>
+          <RequirePermission permission="purchases.view">
             <Tabs<Tab> tabs={tabs} value={tab} onChange={setTab} />
-            {tab === 'requests' && <RequestsTab establishmentId={establishmentId} />}
             {tab === 'orders' && <OrdersTab establishmentId={establishmentId} />}
             {tab === 'receipts' && <ReceiptsTab establishmentId={establishmentId} />}
             {tab === 'returns' && <ReturnsTab establishmentId={establishmentId} />}
-          </>
+          </RequirePermission>
+        )}
+      </RequireEstablishment>
+    </>
+  );
+}
+
+/**
+ * Demandes d'achat : ouvertes à quiconque voit le stock (magasinier, chef,
+ * production…). Les achats voient toutes les demandes ; les autres, les leurs.
+ */
+export function PurchaseRequestsPage() {
+  const { establishment } = useEstablishment();
+  return (
+    <>
+      <PageHeader title="Demandes d’achat" subtitle={establishment ? `${establishment.name} — signaler un besoin aux achats` : undefined} />
+      <RequireEstablishment>
+        {(establishmentId) => (
+          <RequirePermission permission={['stock.view', 'purchases.view']}>
+            <RequestsTab establishmentId={establishmentId} />
+          </RequirePermission>
         )}
       </RequireEstablishment>
     </>

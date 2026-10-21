@@ -174,6 +174,11 @@ export class TransfersService {
   async validate(me: AuthUser, id: string) {
     await this.prisma.$transaction(async (tx) => {
       const t = await this.step(tx, me, id, ['REQUESTED'], 'source');
+      // La sortie de stock vers un autre site est autorisée par un responsable de la
+      // source, pas par le magasinier qui prépare et expédie.
+      if (!me.access.can('inventory.validate', t.sourceEstablishmentId)) {
+        throw new ForbiddenException('La validation d’un transfert revient à un responsable de l’établissement source');
+      }
       await tx.stockTransfer.update({ where: { id }, data: { status: 'VALIDATED', validatedById: me.userId, validatedAt: new Date() } });
       await this.audit.record({ action: 'TRANSFER_VALIDATED', entityType: 'StockTransfer', entityId: id, establishmentId: t.sourceEstablishmentId }, tx);
     });
