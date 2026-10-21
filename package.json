@@ -1,0 +1,25 @@
+{
+  "name": "afrika-food",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AFRIKA FOOD — ERP multisite pâtisserie / boulangerie / restaurant",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "build": "npm run build -w apps/api && npm run build -w apps/web",
+    "test": "npm run test -w apps/api",
+    "db:migrate": "npm run db:migrate -w apps/api",
+    "db:seed": "npm run db:seed -w apps/api"
+  },
+  "allowScripts": {
+    "argon2@0.45.1": true,
+    "prisma@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "@prisma/client@6.19.3": true,
+    "@scarf/scarf": false
+  }
+}

@@ -1,0 +1,244 @@
+// AFRIKA FOOD — modèle de données
+// Module 1 : fondations (entreprise, établissements, utilisateurs, rôles,
+// permissions, sessions, sécurité, audit, numérotation).
+//
+// Conventions :
+// - identifiants UUID ;
+// - colonnes en snake_case (via @map) ;
+// - suppression logique via deleted_at, jamais de DELETE sur les données métier ;
+// - montants en FCFA (XOF) stockés en entiers (BigInt) dans les modules financiers.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EstablishmentType {
+  PATISSERIE
+  RESTAURANT
+  PATISSERIE_RESTAURANT
+  BOULANGERIE_PATISSERIE
+  BOULANGERIE_PATISSERIE_RESTAURANT
+}
+
+model Company {
+  id         String    @id @default(uuid()) @db.Uuid
+  name       String
+  legalName  String?   @map("legal_name")
+  taxId      String?   @map("tax_id")
+  currency   String    @default("XOF") @db.Char(3)
+  phone      String?
+  email      String?
+  address    String?
+  logoUrl    String?   @map("logo_url")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  establishments Establishment[]
+  users          User[]
+  roles          Role[]
+  auditLogs      AuditLog[]
+  sequences      DocumentSequence[]
+
+  @@map("companies")
+}
+
+model Establishment {
+  id            String            @id @default(uuid()) @db.Uuid
+  companyId     String            @map("company_id") @db.Uuid
+  code          String
+  name          String
+  type          EstablishmentType
+  address       String?
+  city          String?
+  phone         String?
+  email         String?
+  receiptHeader String?           @map("receipt_header")
+  receiptFooter String?           @map("receipt_footer")
+  isActive      Boolean           @default(true) @map("is_active")
+  createdAt     DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt     DateTime?         @map("deleted_at") @db.Timestamptz(3)
+
+  company   Company    @relation(fields: [companyId], references: [id])
+  userRoles UserRole[]
+  auditLogs AuditLog[]
+
+  @@unique([companyId, code])
+  @@map("establishments")
+}
+
+model User {
+  id                 String    @id @default(uuid()) @db.Uuid
+  companyId          String    @map("company_id") @db.Uuid
+  email              String    @unique
+  fullName           String    @map("full_name")
+  phone              String?
+  passwordHash       String    @map("password_hash")
+  isActive           Boolean   @default(true) @map("is_active")
+  mustChangePassword Boolean   @default(false) @map("must_change_password")
+  failedLoginCount   Int       @default(0) @map("failed_login_count")
+  lockedUntil        DateTime? @map("locked_until") @db.Timestamptz(3)
+  lastLoginAt        DateTime? @map("last_login_at") @db.Timestamptz(3)
+  passwordChangedAt  DateTime? @map("password_changed_at") @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt          DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  company        Company         @relation(fields: [companyId], references: [id])
+  userRoles      UserRole[]
+  loginSessions  LoginSession[]
+  auditLogs      AuditLog[]
+  securityEvents SecurityEvent[]
+
+  @@index([companyId])
+  @@map("users")
+}
+
+model Permission {
+  code        String  @id
+  module      String
+  label       String
+  description String?
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model Role {
+  id          String    @id @default(uuid()) @db.Uuid
+  companyId   String    @map("company_id") @db.Uuid
+  code        String
+  name        String
+  description String?
+  // Rôle livré par défaut : ses permissions peuvent être ajustées,
+  // mais il ne peut pas être supprimé.
+  isSystem    Boolean   @default(false) @map("is_system")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  company     Company          @relation(fields: [companyId], references: [id])
+  permissions RolePermission[]
+  userRoles   UserRole[]
+
+  @@unique([companyId, code])
+  @@map("roles")
+}
+
+model RolePermission {
+  roleId         String @map("role_id") @db.Uuid
+  permissionCode String @map("permission_code")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionCode], references: [code])
+
+  @@id([roleId, permissionCode])
+  @@map("role_permissions")
+}
+
+// Attribution d'un rôle à un utilisateur.
+// establishment_id NULL = le rôle s'applique à tous les établissements de
+// l'entreprise (direction, comptable groupe…).
+model UserRole {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
+  roleId          String   @map("role_id") @db.Uuid
+  establishmentId String?  @map("establishment_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role          Role           @relation(fields: [roleId], references: [id])
+  establishment Establishment? @relation(fields: [establishmentId], references: [id])
+
+  @@unique([userId, roleId, establishmentId])
+  @@index([userId])
+  @@map("user_roles")
+}
+
+model LoginSession {
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  refreshTokenHash String    @map("refresh_token_hash")
+  ipAddress        String?   @map("ip_address")
+  userAgent        String?   @map("user_agent")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastUsedAt       DateTime  @default(now()) @map("last_used_at") @db.Timestamptz(3)
+  expiresAt        DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(3)
+  revokedReason    String?   @map("revoked_reason")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("login_sessions")
+}
+
+model SecurityEvent {
+  id        BigInt   @id @default(autoincrement())
+  type      String
+  userId    String?  @map("user_id") @db.Uuid
+  email     String?
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  details   Json?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([type, createdAt])
+  @@index([userId])
+  @@map("security_events")
+}
+
+// Journal d'audit : en écriture seule. Aucune route ne permet de le modifier
+// ni de le supprimer.
+model AuditLog {
+  id              BigInt   @id @default(autoincrement())
+  companyId       String   @map("company_id") @db.Uuid
+  establishmentId String?  @map("establishment_id") @db.Uuid
+  userId          String?  @map("user_id") @db.Uuid
+  action          String
+  entityType      String   @map("entity_type")
+  entityId        String?  @map("entity_id")
+  oldValues       Json?    @map("old_values")
+  newValues       Json?    @map("new_values")
+  reason          String?
+  ipAddress       String?  @map("ip_address")
+  userAgent       String?  @map("user_agent")
+  sessionId       String?  @map("session_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  company       Company        @relation(fields: [companyId], references: [id])
+  establishment Establishment? @relation(fields: [establishmentId], references: [id])
+  user          User?          @relation(fields: [userId], references: [id])
+
+  @@index([companyId, createdAt])
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+// Compteurs de numérotation (ventes, factures, achats…).
+// scope_key = id de l'établissement, ou "GLOBAL" pour une numérotation entreprise.
+// L'incrément se fait par INSERT … ON CONFLICT DO UPDATE … RETURNING,
+// donc sans doublon même avec plusieurs caisses simultanées.
+model DocumentSequence {
+  companyId String   @map("company_id") @db.Uuid
+  scopeKey  String   @map("scope_key")
+  docType   String   @map("doc_type")
+  year      Int
+  lastValue Int      @default(0) @map("last_value")
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@id([companyId, scopeKey, docType, year])
+  @@map("document_sequences")
+}

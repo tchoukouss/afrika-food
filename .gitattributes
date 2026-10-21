@@ -1,0 +1,6 @@
+# Fins de ligne LF partout : indispensable pour les migrations Prisma
+# (somme de contrôle du fichier SQL) et cohérent entre Windows et Linux.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
