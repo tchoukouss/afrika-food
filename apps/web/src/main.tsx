@@ -12,6 +12,10 @@ import { CategoriesPage } from './pages/catalog/Categories';
 import { ProductsPage } from './pages/catalog/Products';
 import { RawMaterialsPage } from './pages/catalog/RawMaterials';
 import { SuppliersPage } from './pages/catalog/Suppliers';
+import { CostingPage } from './pages/production/Costing';
+import { ProductionPage } from './pages/production/Production';
+import { RecipesPage } from './pages/production/Recipes';
+import { TraceabilityPage } from './pages/production/Traceability';
 import { InventoryPage } from './pages/stock/Inventory';
 import { PurchaseRequestsPage, PurchasesPage } from './pages/stock/Purchases';
 import { StockPage } from './pages/stock/Stock';
@@ -62,6 +66,10 @@ function App() {
         <Route path="factures-fournisseurs" element={<SupplierFinancePage />} />
         <Route path="inventaires" element={<InventoryPage />} />
         <Route path="transferts" element={<TransfersPage />} />
+        <Route path="production" element={<ProductionPage />} />
+        <Route path="recettes" element={<RecipesPage />} />
+        <Route path="couts-marges" element={<CostingPage />} />
+        <Route path="tracabilite" element={<TraceabilityPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

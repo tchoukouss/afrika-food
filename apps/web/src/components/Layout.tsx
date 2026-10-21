@@ -1,10 +1,14 @@
 import {
   ArrowLeftRight,
+  BookOpen,
   Boxes,
   Building2,
+  Calculator,
   ClipboardCheck,
   ClipboardList,
   Croissant,
+  Factory,
+  GitBranch,
   Home,
   KeyRound,
   LogOut,
@@ -53,6 +57,15 @@ const NAV: { section: string; items: NavItem[] }[] = [
       { to: '/factures-fournisseurs', label: 'Factures fournisseurs', icon: <Receipt className="size-4" />, permission: 'purchases.view' },
       { to: '/inventaires', label: 'Inventaires', icon: <ClipboardCheck className="size-4" />, permission: 'stock.view' },
       { to: '/transferts', label: 'Transferts', icon: <ArrowLeftRight className="size-4" />, permission: 'stock.view' },
+    ],
+  },
+  {
+    section: 'Production',
+    items: [
+      { to: '/production', label: 'Ordres de production', icon: <Factory className="size-4" />, permission: 'stock.view' },
+      { to: '/recettes', label: 'Recettes', icon: <BookOpen className="size-4" />, permission: 'recipes.view' },
+      { to: '/couts-marges', label: 'Coûts & marges', icon: <Calculator className="size-4" />, permission: 'recipes.view' },
+      { to: '/tracabilite', label: 'Traçabilité', icon: <GitBranch className="size-4" />, permission: 'stock.view' },
     ],
   },
   {

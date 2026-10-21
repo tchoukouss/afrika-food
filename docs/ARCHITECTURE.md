@@ -143,3 +143,42 @@ règles du module 3. Un administrateur peut ajuster les rôles depuis l'écran
 Serveur, Caissier, Livreur : aucun accès au module 3.
 Chaque permission s'apprécie dans l'établissement concerné (rôle attribué
 au site) ou au niveau groupe (rôle sans établissement).
+
+## Module 4 — Recettes & production
+
+Décisions validées le 22/10/2026 :
+
+| # | Sujet | Règle |
+|---|---|---|
+| A | Coût de revient | Estimé : lots qui seraient consommés en FEFO dans l'établissement (non périmés, hors réservé), puis dernier prix d'achat (à défaut dernière production, coût de la sous-recette, offre fournisseur). Réel : valeur exacte des lots consommés. |
+| B | Sous-recettes | Un produit fabriqué stocké peut être ingrédient ; boucles refusées (à l'enregistrement et à l'activation) ; coût et traçabilité en cascade. |
+| C | Consommation | Au lancement (quantités théoriques, FEFO) ; à la fin, supplément ou reste rendu avec motif. |
+| D | Réservation | À la validation (FEFO, lots non périmés) ; libérée au lancement ou à l'annulation ; refus si stock disponible insuffisant. |
+| E | Contrôle | Produit en stock dès « Terminée » ; contrôle par un détenteur de « Valider un inventaire », autre que celui qui a terminé ; non-conformité = perte (stock_losses). |
+| F | Péremption | Durée de conservation par version de recette → péremption du lot produit. |
+| G | Niveau | Recettes communes au groupe, écriture au niveau groupe ; coûts par établissement. |
+| H | Magasinier | Lecture des ordres validés et suivants de son site (« Voir les stocks »). |
+| I | Marge | Sur le prix HT (TTC ÷ (1 + TVA)). |
+| J | Écarts | Manque = perte de production (cause et motif) ; surplus accepté avec motif ; coût unitaire sur la quantité bonne. |
+
+Versions : une seule active (index unique partiel) ; une version publiée et
+ses ingrédients ne se modifient plus, même en SQL (triggers). Consommations,
+sorties et pertes de production en ajout seul ; ordres et réservations jamais
+supprimés. Toutes les opérations verrouillent les soldes concernés en une
+seule requête triée (pas d'interblocage entre productions simultanées).
+
+Module 3 : seules les énumérations ont changé (origine de lot PRODUCTION,
+mouvements CONSUMPTION et PRODUCTION) ; le moteur de stock est réutilisé tel
+quel.
+
+### Droits du module 4 par rôle
+
+| Action | Permission | Rôles par défaut |
+|---|---|---|
+| Voir les recettes, coûts et marges | recipes.view | Admin, Directeur, Responsable, Resp. production, Chef de cuisine |
+| Créer / modifier / activer / archiver une recette | recipes.manage au niveau groupe | Admin, Directeur (et tout rôle de groupe détenant la permission) |
+| Voir tous les ordres de production | production.view | Admin, Directeur, Responsable, Resp. production, Chef de cuisine |
+| Voir les ordres validés et suivants (lecture) | stock.view | + Magasinier, Resp. achats |
+| Planifier, modifier, valider, lancer, terminer, annuler | production.manage | Admin, Directeur, Responsable, Resp. production, Chef de cuisine |
+| Contrôler (autre que celui qui a terminé) | inventory.validate | Admin, Directeur, Responsable |
+| Traçabilité d'un lot | stock.view (lot passé par l'établissement) | Admin, Directeur, Responsable, Resp. achats, Magasinier, Resp. production, Chef de cuisine |

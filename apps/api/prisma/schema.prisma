@@ -552,6 +552,7 @@ enum LotOrigin {
   RECEIPT
   INVENTORY
   ADJUSTMENT
+  PRODUCTION // lot de produit fabriqué (module 4)
 }
 
 // Lot : quantité homogène d'un article, avec son coût réel d'achat.
@@ -619,6 +620,8 @@ enum StockMovementType {
   ADJUSTMENT_IN // correction validée (entrée)
   ADJUSTMENT_OUT // correction validée (sortie)
   LOSS // perte / casse / péremption…
+  CONSUMPTION // consommation par une production (négatif) ou retour d'un reste (positif) — module 4
+  PRODUCTION // entrée des produits fabriqués — module 4
 }
 
 // Journal des mouvements : en ajout seul (trigger). quantity signée :
@@ -1258,4 +1261,242 @@ model StockTransferLot {
   transferItem StockTransferItem @relation(fields: [transferItemId], references: [id])
 
   @@map("stock_transfer_lots")
+}
+
+// ===========================================================================
+// Module 4 — Recettes & production.
+//
+// Comme pour le module 3, aucune relation Prisma vers les modèles des modules
+// précédents (produits, matières, établissements, lots, emplacements,
+// utilisateurs) : les clés étrangères sont déclarées en SQL dans la migration.
+// Ingrédient = matière première OU produit fabriqué / revendu (sous-recette).
+// Quantités : Decimal(18,4). Coûts : FCFA (Decimal).
+// ===========================================================================
+
+enum RecipeVersionStatus {
+  DRAFT // en préparation, modifiable
+  ACTIVE // version en vigueur (une seule par recette)
+  ARCHIVED // ancienne version, consultable, jamais modifiée
+}
+
+// Fiche technique d'un produit fabriqué (une par produit, niveau groupe).
+model Recipe {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  productId       String   @unique @map("product_id") @db.Uuid
+  activeVersionId String?  @unique @map("active_version_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  versions RecipeVersion[]
+
+  @@index([companyId])
+  @@map("recipes")
+}
+
+model RecipeVersion {
+  id            String              @id @default(uuid()) @db.Uuid
+  recipeId      String              @map("recipe_id") @db.Uuid
+  version       Int
+  status        RecipeVersionStatus @default(DRAFT)
+  // Rendement : quantité de produit obtenue, dans l'unité de vente du produit.
+  yieldQuantity Decimal             @map("yield_quantity") @db.Decimal(18, 4)
+  // Durée de conservation du produit fini (jours) : fixe la péremption du lot produit.
+  shelfLifeDays Int?                @map("shelf_life_days")
+  instructions  String?
+  notes         String?
+  createdById   String              @map("created_by_id") @db.Uuid
+  activatedById String?             @map("activated_by_id") @db.Uuid
+  activatedAt   DateTime?           @map("activated_at") @db.Timestamptz(3)
+  archivedAt    DateTime?           @map("archived_at") @db.Timestamptz(3)
+  createdAt     DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  recipe Recipe       @relation(fields: [recipeId], references: [id])
+  items  RecipeItem[]
+
+  @@unique([recipeId, version])
+  @@map("recipe_versions")
+}
+
+model RecipeItem {
+  id            String  @id @default(uuid()) @db.Uuid
+  versionId     String  @map("version_id") @db.Uuid
+  rawMaterialId String? @map("raw_material_id") @db.Uuid
+  productId     String? @map("product_id") @db.Uuid
+  // Quantité pour le rendement de la version, dans l'unité indiquée (g, kg, mL, L, u…).
+  quantity      Decimal @db.Decimal(18, 4)
+  unitCode      String  @map("unit_code")
+  // Perte prévue sur l'ingrédient (épluchage, évaporation…), en %.
+  lossPercent   Decimal @default(0) @map("loss_percent") @db.Decimal(5, 2)
+  note          String?
+  sortOrder     Int     @default(0) @map("sort_order")
+
+  version RecipeVersion @relation(fields: [versionId], references: [id])
+
+  @@index([versionId])
+  @@map("recipe_items")
+}
+
+enum ProductionStatus {
+  PLANNED
+  VALIDATED // matières réservées
+  IN_PROGRESS // matières consommées
+  COMPLETED // produits finis entrés en stock
+  CONTROLLED // contrôle qualité effectué
+  CANCELLED
+}
+
+enum ProductionLossStage {
+  COMPLETION // écart entre quantité prévue et produite
+  CONTROL // non-conformité constatée au contrôle
+}
+
+model ProductionOrder {
+  id               String           @id @default(uuid()) @db.Uuid
+  companyId        String           @map("company_id") @db.Uuid
+  establishmentId  String           @map("establishment_id") @db.Uuid
+  number           String
+  clientRequestId  String?          @map("client_request_id") @db.Uuid
+  productId        String           @map("product_id") @db.Uuid
+  // Version de recette figée à la création de l'ordre.
+  recipeVersionId  String           @map("recipe_version_id") @db.Uuid
+  status           ProductionStatus @default(PLANNED)
+  plannedQuantity  Decimal          @map("planned_quantity") @db.Decimal(18, 4)
+  producedQuantity Decimal?         @map("produced_quantity") @db.Decimal(18, 4)
+  plannedDate      DateTime?        @map("planned_date") @db.Date
+  // Emplacement de sortie des matières et d'entrée des produits finis.
+  sourceLocationId String           @map("source_location_id") @db.Uuid
+  destLocationId   String           @map("dest_location_id") @db.Uuid
+  notes            String?
+  // Coûts : théorique (estimation à la création), réel (lots consommés), unitaire réel.
+  theoreticalCost  Decimal?         @map("theoretical_cost") @db.Decimal(18, 2)
+  realCost         Decimal?         @map("real_cost") @db.Decimal(18, 2)
+  unitCost         Decimal?         @map("unit_cost") @db.Decimal(18, 4)
+  overReason       String?          @map("over_reason")
+  controlNote      String?          @map("control_note")
+  cancelReason     String?          @map("cancel_reason")
+  createdById      String           @map("created_by_id") @db.Uuid
+  validatedById    String?          @map("validated_by_id") @db.Uuid
+  validatedAt      DateTime?        @map("validated_at") @db.Timestamptz(3)
+  startedById      String?          @map("started_by_id") @db.Uuid
+  startedAt        DateTime?        @map("started_at") @db.Timestamptz(3)
+  completedById    String?          @map("completed_by_id") @db.Uuid
+  completedAt      DateTime?        @map("completed_at") @db.Timestamptz(3)
+  controlledById   String?          @map("controlled_by_id") @db.Uuid
+  controlledAt     DateTime?        @map("controlled_at") @db.Timestamptz(3)
+  cancelledById    String?          @map("cancelled_by_id") @db.Uuid
+  cancelledAt      DateTime?        @map("cancelled_at") @db.Timestamptz(3)
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items        ProductionItem[]
+  reservations ProductionReservation[]
+  consumptions ProductionConsumption[]
+  outputs      ProductionOutput[]
+  losses       ProductionLoss[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@map("production_orders")
+}
+
+// Besoin théorique par ingrédient, converti dans l'unité de stock de l'article.
+model ProductionItem {
+  id                  String  @id @default(uuid()) @db.Uuid
+  orderId             String  @map("order_id") @db.Uuid
+  rawMaterialId       String? @map("raw_material_id") @db.Uuid
+  productId           String? @map("product_id") @db.Uuid
+  recipeQuantity      Decimal @map("recipe_quantity") @db.Decimal(18, 4)
+  recipeUnitCode      String  @map("recipe_unit_code")
+  lossPercent         Decimal @default(0) @map("loss_percent") @db.Decimal(5, 2)
+  theoreticalQuantity Decimal @map("theoretical_quantity") @db.Decimal(18, 4)
+  // Net consommé (théorique + suppléments − retours).
+  consumedQuantity    Decimal @default(0) @map("consumed_quantity") @db.Decimal(18, 4)
+
+  order ProductionOrder @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("production_items")
+}
+
+// Réservation d'un solde (lot × emplacement) pour un ordre validé.
+model ProductionReservation {
+  id         String    @id @default(uuid()) @db.Uuid
+  orderId    String    @map("order_id") @db.Uuid
+  itemId     String    @map("item_id") @db.Uuid
+  balanceId  String    @map("balance_id") @db.Uuid
+  quantity   Decimal   @db.Decimal(18, 4)
+  releasedAt DateTime? @map("released_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  order ProductionOrder @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([balanceId])
+  @@map("production_reservations")
+}
+
+enum ConsumptionKind {
+  THEORETICAL // sortie au lancement selon la recette
+  EXTRA // supplément déclaré à la fin
+  RETURN // reste rendu au stock (quantité négative)
+}
+
+// Consommation réelle par lot (traçabilité matière → produit).
+model ProductionConsumption {
+  id         String          @id @default(uuid()) @db.Uuid
+  orderId    String          @map("order_id") @db.Uuid
+  itemId     String          @map("item_id") @db.Uuid
+  lotId      String          @map("lot_id") @db.Uuid
+  locationId String          @map("location_id") @db.Uuid
+  kind       ConsumptionKind
+  // Positive = consommée ; négative = rendue au stock.
+  quantity   Decimal         @db.Decimal(18, 4)
+  unitCost   Decimal         @map("unit_cost") @db.Decimal(18, 4)
+  value      Decimal         @db.Decimal(18, 2)
+  reason     String?
+  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  order ProductionOrder @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([lotId])
+  @@map("production_consumptions")
+}
+
+// Lot de produit fini créé par la production.
+model ProductionOutput {
+  id         String   @id @default(uuid()) @db.Uuid
+  orderId    String   @map("order_id") @db.Uuid
+  lotId      String   @unique @map("lot_id") @db.Uuid
+  locationId String   @map("location_id") @db.Uuid
+  quantity   Decimal  @db.Decimal(18, 4)
+  unitCost   Decimal  @map("unit_cost") @db.Decimal(18, 4)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  order ProductionOrder @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("production_outputs")
+}
+
+model ProductionLoss {
+  id          String              @id @default(uuid()) @db.Uuid
+  orderId     String              @map("order_id") @db.Uuid
+  stage       ProductionLossStage
+  quantity    Decimal             @db.Decimal(18, 4)
+  cause       LossCause
+  reason      String
+  value       Decimal             @db.Decimal(18, 2)
+  // Perte enregistrée au stock (module 3) lors d'une non-conformité au contrôle.
+  stockLossId String?             @map("stock_loss_id") @db.Uuid
+  createdById String              @map("created_by_id") @db.Uuid
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  order ProductionOrder @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("production_losses")
 }

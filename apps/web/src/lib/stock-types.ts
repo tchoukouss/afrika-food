@@ -72,6 +72,8 @@ export const MOVEMENT_TYPES: Record<string, string> = {
   ADJUSTMENT_IN: 'Correction (+)',
   ADJUSTMENT_OUT: 'Correction (−)',
   LOSS: 'Perte',
+  CONSUMPTION: 'Consommation (production)',
+  PRODUCTION: 'Entrée de production',
 };
 
 export interface Movement {
