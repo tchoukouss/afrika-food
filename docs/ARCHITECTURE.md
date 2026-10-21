@@ -79,3 +79,40 @@ Migrations : générées par différence entre le schéma Prisma de la version
 précédente et le nouveau (`prisma migrate diff --from-schema-datamodel …`),
 complétées à la main par les contraintes que Prisma ne sait pas exprimer
 (CHECK, index partiels, triggers). Application avec `prisma migrate deploy`.
+
+## Module 3 — Achats & stock
+
+Choix fonctionnels validés le 21/10/2026 :
+
+| Sujet | Règle |
+|---|---|
+| Valorisation | Coût réel par lot (prix d'achat TTC ÷ contenu). Valeur du stock = somme des lots ; coût moyen calculé. |
+| Sorties | FEFO (le lot qui périme le plus tôt, puis le plus ancien), lot imposable. Jamais de stock négatif ni d'entame du stock réservé (verrous + CHECK en base). |
+| Péremption | Lot périmé bloqué pour l'usage (sortie, transfert, déplacement, correction) ; sort uniquement par une perte « péremption », l'inventaire ou un retour fournisseur. |
+| Réception | Avec commande ou directe (tracée). Contrôle : quantités refusées avec motif. Écart de quantité ou de prix avec la commande : motif obligatoire ; le prix réel valorise le lot. Date d'expiration obligatoire pour une matière périssable. |
+| Commandes | Brouillon → validée (par un détenteur de « purchases.manage », éventuellement l'auteur) → partiellement reçue → reçue / clôturée (reliquat) ; annulable tant que rien n'est reçu. Les demandes d'achat sont rattachées à la commande. |
+| Factures fournisseurs | Rattachées à des réceptions (une réception n'est facturée qu'une fois) ; écart affiché ; montant de la facture = montant dû. Annulation tracée uniquement sans règlement. |
+| Paiements | Partiels, multi-factures, avance possible (affectable plus tard), jamais au-delà du reste à payer ; annulation tracée. Lien avec la caisse : module 5. |
+| Retours | Sortie des lots du fournisseur au coût du lot + avoir (imputable sur une facture). |
+| Corrections | Demande (stock.adjust) puis validation (inventory.validate). Les pertes avec cause sont immédiates. |
+| Inventaire | Gel de l'emplacement pendant le comptage ; écarts justifiés ; surplus valorisés au coût proposé (dernier lot, sinon offre préférée) ; sert aussi d'inventaire d'ouverture. |
+| Transferts | Demande (destination) → validation, préparation, expédition (source) → réception (destination) → clôture. Mêmes lots de bout en bout ; manque = perte « transit » de la source. |
+| Emplacements | « Magasin principal » créé automatiquement par établissement ; autres emplacements libres. |
+| Seuils | Par article et par établissement ; statut « sous le seuil » / « critique ». |
+| Réservations | Mécanisme en place (physique / réservé / disponible) ; alimenté par les modules 4 et 7. |
+
+Les modèles des modules 1 et 2 ne sont pas modifiés : les clés étrangères du
+module 3 vers leurs tables sont déclarées en SQL dans la migration.
+Le journal `stock_movements` est en ajout seul (trigger) ; soldes, lots,
+réceptions, factures et paiements fournisseurs ne peuvent pas être supprimés.
+
+### Anti double envoi (double clic, double paiement, coupure réseau)
+
+Chaque création du module 3 (demande, commande, réception, retour, facture,
+paiement, perte, correction, déplacement, transfert) accepte un
+`clientRequestId` (UUID généré une fois par formulaire et renvoyé à chaque
+tentative). Un index unique `(company_id, client_request_id)` garantit qu'un
+même envoi ne crée qu'un document ; les envois suivants, même simultanés,
+reçoivent le document déjà créé. Un identifiant ne peut être rejoué que par
+l'utilisateur qui l'a émis. Les changements de statut (valider, expédier,
+recevoir…) sont protégés par leur contrôle de statut (409 au second envoi).

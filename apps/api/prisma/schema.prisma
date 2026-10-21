@@ -516,3 +516,746 @@ model ProductComponent {
   @@unique([menuProductId, componentProductId])
   @@map("product_components")
 }
+
+// ===========================================================================
+// Module 3 — Achats & stock.
+//
+// Aucune relation Prisma vers les modèles des modules 1 et 2 (pour ne pas les
+// modifier) : les clés étrangères vers companies, establishments,
+// raw_materials, products, suppliers et users sont déclarées en SQL dans la
+// migration. Article = matière première (raw_material_id) OU produit
+// (product_id), exactement l'un des deux (contrainte CHECK).
+//
+// Quantités : Decimal(18,4) dans l'unité de base de l'article.
+// Coûts unitaires : Decimal(18,4) FCFA par unité de base. Montants : BigInt FCFA.
+// ===========================================================================
+
+model StockLocation {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  code            String
+  name            String
+  // Emplacement par défaut (« Magasin principal »), créé automatiquement.
+  isDefault       Boolean  @default(false) @map("is_default")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  balances StockBalance[]
+
+  @@unique([establishmentId, code])
+  @@map("stock_locations")
+}
+
+enum LotOrigin {
+  RECEIPT
+  INVENTORY
+  ADJUSTMENT
+}
+
+// Lot : quantité homogène d'un article, avec son coût réel d'achat.
+// Le lot appartient à l'entreprise et peut se trouver dans plusieurs
+// emplacements (après un transfert) : voir stock_balances.
+model StockLot {
+  id             String    @id @default(uuid()) @db.Uuid
+  companyId      String    @map("company_id") @db.Uuid
+  lotNumber      String    @map("lot_number")
+  rawMaterialId  String?   @map("raw_material_id") @db.Uuid
+  productId      String?   @map("product_id") @db.Uuid
+  origin         LotOrigin
+  supplierId     String?   @map("supplier_id") @db.Uuid
+  brand          String?
+  supplierLotRef String?   @map("supplier_lot_ref")
+  productionDate DateTime? @map("production_date") @db.Date
+  expiryDate     DateTime? @map("expiry_date") @db.Date
+  unitCost       Decimal   @map("unit_cost") @db.Decimal(18, 4)
+  receiptItemId  String?   @unique @map("receipt_item_id") @db.Uuid
+  createdById    String?   @map("created_by_id") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  balances    StockBalance[]
+  receiptItem GoodsReceiptItem? @relation(fields: [receiptItemId], references: [id])
+
+  @@unique([companyId, lotNumber])
+  @@index([rawMaterialId])
+  @@index([productId])
+  @@index([expiryDate])
+  @@map("stock_lots")
+}
+
+// Solde d'un lot dans un emplacement. Jamais négatif (CHECK en base).
+// Disponible = quantity - reserved_quantity.
+model StockBalance {
+  id               String   @id @default(uuid()) @db.Uuid
+  companyId        String   @map("company_id") @db.Uuid
+  establishmentId  String   @map("establishment_id") @db.Uuid
+  locationId       String   @map("location_id") @db.Uuid
+  lotId            String   @map("lot_id") @db.Uuid
+  rawMaterialId    String?  @map("raw_material_id") @db.Uuid
+  productId        String?  @map("product_id") @db.Uuid
+  quantity         Decimal  @default(0) @db.Decimal(18, 4)
+  reservedQuantity Decimal  @default(0) @map("reserved_quantity") @db.Decimal(18, 4)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  location StockLocation @relation(fields: [locationId], references: [id])
+  lot      StockLot      @relation(fields: [lotId], references: [id])
+
+  @@unique([locationId, lotId])
+  @@index([establishmentId, rawMaterialId])
+  @@index([establishmentId, productId])
+  @@map("stock_balances")
+}
+
+enum StockMovementType {
+  RECEIPT // réception fournisseur
+  SUPPLIER_RETURN // retour au fournisseur
+  TRANSFER_OUT // expédition vers un autre établissement
+  TRANSFER_IN // réception d'un transfert
+  LOCATION_OUT // déplacement entre emplacements (sortie)
+  LOCATION_IN // déplacement entre emplacements (entrée)
+  INVENTORY_GAIN // écart d'inventaire positif
+  INVENTORY_LOSS // écart d'inventaire négatif
+  ADJUSTMENT_IN // correction validée (entrée)
+  ADJUSTMENT_OUT // correction validée (sortie)
+  LOSS // perte / casse / péremption…
+}
+
+// Journal des mouvements : en ajout seul (trigger). quantity signée :
+// positive = entrée, négative = sortie. Chaque mouvement a une origine.
+model StockMovement {
+  id              BigInt            @id @default(autoincrement())
+  companyId       String            @map("company_id") @db.Uuid
+  establishmentId String            @map("establishment_id") @db.Uuid
+  locationId      String            @map("location_id") @db.Uuid
+  lotId           String            @map("lot_id") @db.Uuid
+  rawMaterialId   String?           @map("raw_material_id") @db.Uuid
+  productId       String?           @map("product_id") @db.Uuid
+  type            StockMovementType
+  quantity        Decimal           @db.Decimal(18, 4)
+  unitCost        Decimal           @map("unit_cost") @db.Decimal(18, 4)
+  value           Decimal           @db.Decimal(18, 2)
+  balanceAfter    Decimal           @map("balance_after") @db.Decimal(18, 4)
+  originType      String            @map("origin_type")
+  originId        String            @map("origin_id") @db.Uuid
+  reason          String?
+  userId          String?           @map("user_id") @db.Uuid
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([establishmentId, createdAt])
+  @@index([lotId])
+  @@index([originType, originId])
+  @@index([rawMaterialId, createdAt])
+  @@index([productId, createdAt])
+  @@map("stock_movements")
+}
+
+// Stock minimum et seuil d'alerte, par article et par établissement.
+model StockThreshold {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  rawMaterialId   String?  @map("raw_material_id") @db.Uuid
+  productId       String?  @map("product_id") @db.Uuid
+  minQuantity     Decimal  @map("min_quantity") @db.Decimal(18, 4)
+  alertQuantity   Decimal  @map("alert_quantity") @db.Decimal(18, 4)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([establishmentId, rawMaterialId])
+  @@unique([establishmentId, productId])
+  @@map("stock_thresholds")
+}
+
+// --- Achats -----------------------------------------------------------------
+
+enum PurchaseRequestStatus {
+  OPEN // en attente de traitement par les achats
+  ORDERED // transformée en commande
+  REJECTED
+  CANCELLED
+}
+
+model PurchaseRequest {
+  id              String                @id @default(uuid()) @db.Uuid
+  companyId       String                @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?               @map("client_request_id") @db.Uuid
+  establishmentId String                @map("establishment_id") @db.Uuid
+  number          String
+  status          PurchaseRequestStatus @default(OPEN)
+  neededBy        DateTime?             @map("needed_by") @db.Date
+  notes           String?
+  requestedById   String                @map("requested_by_id") @db.Uuid
+  purchaseOrderId String?               @map("purchase_order_id") @db.Uuid
+  decidedById     String?               @map("decided_by_id") @db.Uuid
+  decidedAt       DateTime?             @map("decided_at") @db.Timestamptz(3)
+  decisionNote    String?               @map("decision_note")
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items         PurchaseRequestItem[]
+  purchaseOrder PurchaseOrder?        @relation(fields: [purchaseOrderId], references: [id])
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@map("purchase_requests")
+}
+
+model PurchaseRequestItem {
+  id            String  @id @default(uuid()) @db.Uuid
+  requestId     String  @map("request_id") @db.Uuid
+  rawMaterialId String? @map("raw_material_id") @db.Uuid
+  productId     String? @map("product_id") @db.Uuid
+  quantity      Decimal @db.Decimal(18, 4)
+  note          String?
+
+  request PurchaseRequest @relation(fields: [requestId], references: [id])
+
+  @@map("purchase_request_items")
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  VALIDATED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CLOSED // soldée avec un reliquat non livré
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id              String              @id @default(uuid()) @db.Uuid
+  companyId       String              @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?             @map("client_request_id") @db.Uuid
+  establishmentId String              @map("establishment_id") @db.Uuid
+  number          String
+  supplierId      String              @map("supplier_id") @db.Uuid
+  status          PurchaseOrderStatus @default(DRAFT)
+  orderDate       DateTime            @default(now()) @map("order_date") @db.Date
+  expectedDate    DateTime?           @map("expected_date") @db.Date
+  paymentTerms    String?             @map("payment_terms")
+  notes           String?
+  // Remise globale sur la commande (FCFA TTC).
+  discountAmount  BigInt              @default(0) @map("discount_amount")
+  subtotal        BigInt              @default(0)
+  total           BigInt              @default(0)
+  createdById     String              @map("created_by_id") @db.Uuid
+  validatedById   String?             @map("validated_by_id") @db.Uuid
+  validatedAt     DateTime?           @map("validated_at") @db.Timestamptz(3)
+  closedById      String?             @map("closed_by_id") @db.Uuid
+  closedAt        DateTime?           @map("closed_at") @db.Timestamptz(3)
+  closeReason     String?             @map("close_reason")
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items    PurchaseOrderItem[]
+  requests PurchaseRequest[]
+  receipts GoodsReceipt[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@index([supplierId])
+  @@map("purchase_orders")
+}
+
+// Ligne de commande, exprimée en unités d'achat (ex. 100 « Sac 25 kg »).
+model PurchaseOrderItem {
+  id                      String  @id @default(uuid()) @db.Uuid
+  orderId                 String  @map("order_id") @db.Uuid
+  rawMaterialId           String? @map("raw_material_id") @db.Uuid
+  productId               String? @map("product_id") @db.Uuid
+  supplierProductId       String? @map("supplier_product_id") @db.Uuid
+  purchaseUnitLabel       String  @map("purchase_unit_label")
+  quantityPerPurchaseUnit Decimal @map("quantity_per_purchase_unit") @db.Decimal(18, 4)
+  orderedQuantity         Decimal @map("ordered_quantity") @db.Decimal(18, 4)
+  // Prix TTC par unité d'achat et remise de ligne (FCFA).
+  unitPrice               BigInt  @map("unit_price")
+  discountAmount          BigInt  @default(0) @map("discount_amount")
+  lineTotal               BigInt  @map("line_total")
+  // Cumul reçu (accepté), en unités d'achat.
+  receivedQuantity        Decimal @default(0) @map("received_quantity") @db.Decimal(18, 4)
+
+  order        PurchaseOrder      @relation(fields: [orderId], references: [id])
+  receiptItems GoodsReceiptItem[]
+
+  @@index([orderId])
+  @@map("purchase_order_items")
+}
+
+// Réception : validée en une fois (contrôle compris) ; elle crée les lots
+// et les entrées en stock. Avec ou sans commande (réception directe).
+model GoodsReceipt {
+  id                  String   @id @default(uuid()) @db.Uuid
+  companyId           String   @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId     String?  @map("client_request_id") @db.Uuid
+  establishmentId     String   @map("establishment_id") @db.Uuid
+  locationId          String   @map("location_id") @db.Uuid
+  number              String
+  supplierId          String   @map("supplier_id") @db.Uuid
+  purchaseOrderId     String?  @map("purchase_order_id") @db.Uuid
+  supplierDocumentRef String?  @map("supplier_document_ref")
+  receivedAt          DateTime @default(now()) @map("received_at") @db.Timestamptz(3)
+  notes               String?
+  // Valeur des quantités acceptées (FCFA TTC).
+  totalValue          BigInt   @map("total_value")
+  receivedById        String   @map("received_by_id") @db.Uuid
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  purchaseOrder PurchaseOrder?           @relation(fields: [purchaseOrderId], references: [id])
+  items         GoodsReceiptItem[]
+  invoiceLinks  SupplierInvoiceReceipt[]
+  returns       SupplierReturn[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, receivedAt])
+  @@index([supplierId])
+  @@map("goods_receipts")
+}
+
+model GoodsReceiptItem {
+  id                      String    @id @default(uuid()) @db.Uuid
+  receiptId               String    @map("receipt_id") @db.Uuid
+  orderItemId             String?   @map("order_item_id") @db.Uuid
+  rawMaterialId           String?   @map("raw_material_id") @db.Uuid
+  productId               String?   @map("product_id") @db.Uuid
+  purchaseUnitLabel       String    @map("purchase_unit_label")
+  quantityPerPurchaseUnit Decimal   @map("quantity_per_purchase_unit") @db.Decimal(18, 4)
+  // Quantités en unités d'achat : reçue, refusée au contrôle, acceptée.
+  receivedQuantity        Decimal   @map("received_quantity") @db.Decimal(18, 4)
+  rejectedQuantity        Decimal   @default(0) @map("rejected_quantity") @db.Decimal(18, 4)
+  acceptedQuantity        Decimal   @map("accepted_quantity") @db.Decimal(18, 4)
+  rejectionReason         String?   @map("rejection_reason")
+  // Écart de quantité ou de prix par rapport à la commande : motif obligatoire.
+  varianceReason          String?   @map("variance_reason")
+  unitPrice               BigInt    @map("unit_price")
+  orderedUnitPrice        BigInt?   @map("ordered_unit_price")
+  lineValue               BigInt    @map("line_value")
+  brand                   String?
+  supplierLotRef          String?   @map("supplier_lot_ref")
+  productionDate          DateTime? @map("production_date") @db.Date
+  expiryDate              DateTime? @map("expiry_date") @db.Date
+
+  receipt   GoodsReceipt       @relation(fields: [receiptId], references: [id])
+  orderItem PurchaseOrderItem? @relation(fields: [orderItemId], references: [id])
+  lot       StockLot?
+
+  @@index([receiptId])
+  @@map("goods_receipt_items")
+}
+
+// --- Factures, paiements, retours fournisseurs --------------------------------
+
+enum SupplierInvoiceStatus {
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  CANCELLED
+}
+
+model SupplierInvoice {
+  id              String                @id @default(uuid()) @db.Uuid
+  companyId       String                @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?               @map("client_request_id") @db.Uuid
+  establishmentId String                @map("establishment_id") @db.Uuid
+  number          String
+  supplierId      String                @map("supplier_id") @db.Uuid
+  // Numéro figurant sur la facture du fournisseur.
+  supplierRef     String                @map("supplier_ref")
+  invoiceDate     DateTime              @map("invoice_date") @db.Date
+  dueDate         DateTime              @map("due_date") @db.Date
+  amount          BigInt
+  // Valeur des réceptions rattachées au moment de l'enregistrement (pour l'écart).
+  receivedValue   BigInt                @map("received_value")
+  paidAmount      BigInt                @default(0) @map("paid_amount")
+  status          SupplierInvoiceStatus @default(OPEN)
+  notes           String?
+  createdById     String                @map("created_by_id") @db.Uuid
+  cancelledById   String?               @map("cancelled_by_id") @db.Uuid
+  cancelledAt     DateTime?             @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason    String?               @map("cancel_reason")
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  receipts    SupplierInvoiceReceipt[]
+  allocations SupplierPaymentAllocation[]
+  creditNotes SupplierCreditNote[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([supplierId, status])
+  @@map("supplier_invoices")
+}
+
+model SupplierInvoiceReceipt {
+  invoiceId String @map("invoice_id") @db.Uuid
+  receiptId String @map("receipt_id") @db.Uuid
+
+  invoice SupplierInvoice @relation(fields: [invoiceId], references: [id])
+  receipt GoodsReceipt    @relation(fields: [receiptId], references: [id])
+
+  @@id([invoiceId, receiptId])
+  @@index([receiptId])
+  @@map("supplier_invoice_receipts")
+}
+
+enum PaymentMethod {
+  CASH
+  ORANGE_MONEY
+  MTN_MONEY
+  MOOV_MONEY
+  WAVE
+  CARD
+  BANK_TRANSFER
+  CHEQUE
+  OTHER
+}
+
+// Paiement fournisseur. Jamais supprimé : une annulation est tracée.
+// Partie non affectée à une facture = avance.
+model SupplierPayment {
+  id              String        @id @default(uuid()) @db.Uuid
+  companyId       String        @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?       @map("client_request_id") @db.Uuid
+  establishmentId String        @map("establishment_id") @db.Uuid
+  number          String
+  supplierId      String        @map("supplier_id") @db.Uuid
+  amount          BigInt
+  method          PaymentMethod
+  reference       String?
+  paidAt          DateTime      @default(now()) @map("paid_at") @db.Timestamptz(3)
+  notes           String?
+  createdById     String        @map("created_by_id") @db.Uuid
+  cancelledById   String?       @map("cancelled_by_id") @db.Uuid
+  cancelledAt     DateTime?     @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason    String?       @map("cancel_reason")
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  allocations SupplierPaymentAllocation[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([supplierId])
+  @@map("supplier_payments")
+}
+
+model SupplierPaymentAllocation {
+  id        String   @id @default(uuid()) @db.Uuid
+  paymentId String   @map("payment_id") @db.Uuid
+  invoiceId String   @map("invoice_id") @db.Uuid
+  amount    BigInt
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  payment SupplierPayment @relation(fields: [paymentId], references: [id])
+  invoice SupplierInvoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([paymentId])
+  @@index([invoiceId])
+  @@map("supplier_payment_allocations")
+}
+
+model SupplierReturn {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?  @map("client_request_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  locationId      String   @map("location_id") @db.Uuid
+  number          String
+  supplierId      String   @map("supplier_id") @db.Uuid
+  receiptId       String?  @map("receipt_id") @db.Uuid
+  reason          String
+  totalValue      BigInt   @map("total_value")
+  createdById     String   @map("created_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  receipt    GoodsReceipt?        @relation(fields: [receiptId], references: [id])
+  items      SupplierReturnItem[]
+  creditNote SupplierCreditNote?
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@map("supplier_returns")
+}
+
+model SupplierReturnItem {
+  id       String  @id @default(uuid()) @db.Uuid
+  returnId String  @map("return_id") @db.Uuid
+  lotId    String  @map("lot_id") @db.Uuid
+  quantity Decimal @db.Decimal(18, 4)
+  unitCost Decimal @map("unit_cost") @db.Decimal(18, 4)
+  value    BigInt
+
+  supplierReturn SupplierReturn @relation(fields: [returnId], references: [id])
+
+  @@map("supplier_return_items")
+}
+
+// Avoir fournisseur (issu d'un retour). S'il est rattaché à une facture,
+// il compte dans le montant réglé de cette facture ; sinon il réduit le solde.
+model SupplierCreditNote {
+  id         String   @id @default(uuid()) @db.Uuid
+  companyId  String   @map("company_id") @db.Uuid
+  number     String
+  supplierId String   @map("supplier_id") @db.Uuid
+  returnId   String   @unique @map("return_id") @db.Uuid
+  invoiceId  String?  @map("invoice_id") @db.Uuid
+  amount     BigInt
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  supplierReturn SupplierReturn   @relation(fields: [returnId], references: [id])
+  invoice        SupplierInvoice? @relation(fields: [invoiceId], references: [id])
+
+  @@unique([companyId, number])
+  @@index([supplierId])
+  @@map("supplier_credit_notes")
+}
+
+// --- Inventaires, corrections, pertes, déplacements ---------------------------
+
+enum InventoryStatus {
+  OPEN
+  VALIDATED
+  CANCELLED
+}
+
+// Tant qu'un inventaire est OPEN, son emplacement est gelé (aucun mouvement).
+model InventorySession {
+  id              String          @id @default(uuid()) @db.Uuid
+  companyId       String          @map("company_id") @db.Uuid
+  establishmentId String          @map("establishment_id") @db.Uuid
+  locationId      String          @map("location_id") @db.Uuid
+  number          String
+  status          InventoryStatus @default(OPEN)
+  notes           String?
+  openedById      String          @map("opened_by_id") @db.Uuid
+  openedAt        DateTime        @default(now()) @map("opened_at") @db.Timestamptz(3)
+  closedById      String?         @map("closed_by_id") @db.Uuid
+  closedAt        DateTime?       @map("closed_at") @db.Timestamptz(3)
+
+  items InventoryItem[]
+
+  @@unique([companyId, number])
+  @@index([locationId, status])
+  @@map("inventory_sessions")
+}
+
+model InventoryItem {
+  id                  String    @id @default(uuid()) @db.Uuid
+  sessionId           String    @map("session_id") @db.Uuid
+  rawMaterialId       String?   @map("raw_material_id") @db.Uuid
+  productId           String?   @map("product_id") @db.Uuid
+  // Stock théorique figé à l'ouverture (l'emplacement est gelé ensuite).
+  theoreticalQuantity Decimal   @map("theoretical_quantity") @db.Decimal(18, 4)
+  countedQuantity     Decimal?  @map("counted_quantity") @db.Decimal(18, 4)
+  // Coût unitaire des quantités en plus (proposé, modifiable).
+  unitCost            Decimal?  @map("unit_cost") @db.Decimal(18, 4)
+  justification       String?
+  countedById         String?   @map("counted_by_id") @db.Uuid
+  countedAt           DateTime? @map("counted_at") @db.Timestamptz(3)
+
+  session InventorySession @relation(fields: [sessionId], references: [id])
+
+  @@index([sessionId])
+  @@map("inventory_items")
+}
+
+enum AdjustmentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum AdjustmentDirection {
+  IN
+  OUT
+}
+
+// Correction de stock : demandée, puis validée (ou refusée) par un responsable.
+model StockAdjustment {
+  id              String              @id @default(uuid()) @db.Uuid
+  companyId       String              @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?             @map("client_request_id") @db.Uuid
+  establishmentId String              @map("establishment_id") @db.Uuid
+  locationId      String              @map("location_id") @db.Uuid
+  number          String
+  status          AdjustmentStatus    @default(PENDING)
+  rawMaterialId   String?             @map("raw_material_id") @db.Uuid
+  productId       String?             @map("product_id") @db.Uuid
+  direction       AdjustmentDirection
+  quantity        Decimal             @db.Decimal(18, 4)
+  // Sortie : lot visé (facultatif, FEFO sinon). Entrée : coût unitaire du nouveau lot.
+  lotId           String?             @map("lot_id") @db.Uuid
+  unitCost        Decimal?            @map("unit_cost") @db.Decimal(18, 4)
+  reason          String
+  requestedById   String              @map("requested_by_id") @db.Uuid
+  decidedById     String?             @map("decided_by_id") @db.Uuid
+  decidedAt       DateTime?           @map("decided_at") @db.Timestamptz(3)
+  decisionNote    String?             @map("decision_note")
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@map("stock_adjustments")
+}
+
+enum LossCause {
+  EXPIRED
+  BURNT
+  BROKEN
+  PRODUCTION_ERROR
+  CUSTOMER_RETURN
+  QUALITY
+  TRANSIT
+  OTHER
+}
+
+model StockLoss {
+  id              String    @id @default(uuid()) @db.Uuid
+  companyId       String    @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?   @map("client_request_id") @db.Uuid
+  establishmentId String    @map("establishment_id") @db.Uuid
+  // NULL pour une perte en transit (le stock avait déjà quitté l'emplacement).
+  locationId      String?   @map("location_id") @db.Uuid
+  number          String
+  rawMaterialId   String?   @map("raw_material_id") @db.Uuid
+  productId       String?   @map("product_id") @db.Uuid
+  lotId           String?   @map("lot_id") @db.Uuid
+  quantity        Decimal   @db.Decimal(18, 4)
+  cause           LossCause
+  comment         String?
+  estimatedValue  BigInt    @map("estimated_value")
+  transferId      String?   @map("transfer_id") @db.Uuid
+  declaredById    String    @map("declared_by_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, createdAt])
+  @@map("stock_losses")
+}
+
+// Déplacement de stock entre deux emplacements d'un même établissement.
+model LocationMove {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId String?  @map("client_request_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  number          String
+  fromLocationId  String   @map("from_location_id") @db.Uuid
+  toLocationId    String   @map("to_location_id") @db.Uuid
+  rawMaterialId   String?  @map("raw_material_id") @db.Uuid
+  productId       String?  @map("product_id") @db.Uuid
+  quantity        Decimal  @db.Decimal(18, 4)
+  reason          String?
+  createdById     String   @map("created_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@map("location_moves")
+}
+
+// --- Transferts entre établissements ------------------------------------------
+
+enum TransferStatus {
+  REQUESTED
+  VALIDATED
+  PREPARED
+  SHIPPED
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+model StockTransfer {
+  id                    String         @id @default(uuid()) @db.Uuid
+  companyId             String         @map("company_id") @db.Uuid
+  // Identifiant envoyé par le formulaire : un même envoi (double clic, renvoi
+  // après coupure réseau) ne crée jamais deux documents.
+  clientRequestId       String?        @map("client_request_id") @db.Uuid
+  number                String
+  sourceEstablishmentId String         @map("source_establishment_id") @db.Uuid
+  sourceLocationId      String?        @map("source_location_id") @db.Uuid
+  destEstablishmentId   String         @map("dest_establishment_id") @db.Uuid
+  destLocationId        String?        @map("dest_location_id") @db.Uuid
+  status                TransferStatus @default(REQUESTED)
+  notes                 String?
+  requestedById         String         @map("requested_by_id") @db.Uuid
+  requestedAt           DateTime       @default(now()) @map("requested_at") @db.Timestamptz(3)
+  validatedById         String?        @map("validated_by_id") @db.Uuid
+  validatedAt           DateTime?      @map("validated_at") @db.Timestamptz(3)
+  preparedById          String?        @map("prepared_by_id") @db.Uuid
+  preparedAt            DateTime?      @map("prepared_at") @db.Timestamptz(3)
+  shippedById           String?        @map("shipped_by_id") @db.Uuid
+  shippedAt             DateTime?      @map("shipped_at") @db.Timestamptz(3)
+  receivedById          String?        @map("received_by_id") @db.Uuid
+  receivedAt            DateTime?      @map("received_at") @db.Timestamptz(3)
+  closedById            String?        @map("closed_by_id") @db.Uuid
+  closedAt              DateTime?      @map("closed_at") @db.Timestamptz(3)
+  cancelledById         String?        @map("cancelled_by_id") @db.Uuid
+  cancelledAt           DateTime?      @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason          String?        @map("cancel_reason")
+  createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items StockTransferItem[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([sourceEstablishmentId, status])
+  @@index([destEstablishmentId, status])
+  @@map("stock_transfers")
+}
+
+model StockTransferItem {
+  id                String   @id @default(uuid()) @db.Uuid
+  transferId        String   @map("transfer_id") @db.Uuid
+  rawMaterialId     String?  @map("raw_material_id") @db.Uuid
+  productId         String?  @map("product_id") @db.Uuid
+  requestedQuantity Decimal  @map("requested_quantity") @db.Decimal(18, 4)
+  // Quantité préparée (peut différer de la demande), puis expédiée et reçue.
+  preparedQuantity  Decimal? @map("prepared_quantity") @db.Decimal(18, 4)
+  shippedQuantity   Decimal? @map("shipped_quantity") @db.Decimal(18, 4)
+  receivedQuantity  Decimal? @map("received_quantity") @db.Decimal(18, 4)
+  gapReason         String?  @map("gap_reason")
+
+  transfer StockTransfer      @relation(fields: [transferId], references: [id])
+  lots     StockTransferLot[]
+
+  @@index([transferId])
+  @@map("stock_transfer_items")
+}
+
+// Lots expédiés pour une ligne de transfert (traçabilité de bout en bout).
+model StockTransferLot {
+  id               String   @id @default(uuid()) @db.Uuid
+  transferItemId   String   @map("transfer_item_id") @db.Uuid
+  lotId            String   @map("lot_id") @db.Uuid
+  shippedQuantity  Decimal  @map("shipped_quantity") @db.Decimal(18, 4)
+  receivedQuantity Decimal? @map("received_quantity") @db.Decimal(18, 4)
+  unitCost         Decimal  @map("unit_cost") @db.Decimal(18, 4)
+
+  transferItem StockTransferItem @relation(fields: [transferItemId], references: [id])
+
+  @@map("stock_transfer_lots")
+}

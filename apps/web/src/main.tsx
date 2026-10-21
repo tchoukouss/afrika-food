@@ -12,6 +12,11 @@ import { CategoriesPage } from './pages/catalog/Categories';
 import { ProductsPage } from './pages/catalog/Products';
 import { RawMaterialsPage } from './pages/catalog/RawMaterials';
 import { SuppliersPage } from './pages/catalog/Suppliers';
+import { InventoryPage } from './pages/stock/Inventory';
+import { PurchasesPage } from './pages/stock/Purchases';
+import { StockPage } from './pages/stock/Stock';
+import { SupplierFinancePage } from './pages/stock/SupplierFinance';
+import { TransfersPage } from './pages/stock/Transfers';
 import { ChangePasswordPage } from './pages/ChangePassword';
 import { CompanyPage } from './pages/Company';
 import { EstablishmentsPage } from './pages/Establishments';
@@ -51,6 +56,11 @@ function App() {
         <Route path="matieres" element={<RawMaterialsPage />} />
         <Route path="fournisseurs" element={<SuppliersPage />} />
         <Route path="categories" element={<CategoriesPage />} />
+        <Route path="stock" element={<StockPage />} />
+        <Route path="achats" element={<PurchasesPage />} />
+        <Route path="factures-fournisseurs" element={<SupplierFinancePage />} />
+        <Route path="inventaires" element={<InventoryPage />} />
+        <Route path="transferts" element={<TransfersPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

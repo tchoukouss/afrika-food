@@ -1,4 +1,24 @@
-import { Building2, Croissant, Home, KeyRound, LogOut, Menu, ScrollText, Settings, ShieldCheck, Tags, Truck, Users, Wheat, X } from 'lucide-react';
+import {
+  ArrowLeftRight,
+  Boxes,
+  Building2,
+  ClipboardCheck,
+  Croissant,
+  Home,
+  KeyRound,
+  LogOut,
+  Menu,
+  Receipt,
+  ScrollText,
+  Settings,
+  ShieldCheck,
+  ShoppingCart,
+  Tags,
+  Truck,
+  Users,
+  Wheat,
+  X,
+} from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
@@ -21,6 +41,16 @@ const NAV: { section: string; items: NavItem[] }[] = [
       { to: '/matieres', label: 'Matières premières', icon: <Wheat className="size-4" />, permission: 'products.view' },
       { to: '/fournisseurs', label: 'Fournisseurs', icon: <Truck className="size-4" />, permission: 'suppliers.view' },
       { to: '/categories', label: 'Catégories', icon: <Tags className="size-4" />, permission: 'products.view' },
+    ],
+  },
+  {
+    section: 'Achats & stock',
+    items: [
+      { to: '/stock', label: 'Stock', icon: <Boxes className="size-4" />, permission: 'stock.view' },
+      { to: '/achats', label: 'Achats', icon: <ShoppingCart className="size-4" />, permission: 'purchases.view' },
+      { to: '/factures-fournisseurs', label: 'Factures fournisseurs', icon: <Receipt className="size-4" />, permission: 'purchases.view' },
+      { to: '/inventaires', label: 'Inventaires', icon: <ClipboardCheck className="size-4" />, permission: 'stock.view' },
+      { to: '/transferts', label: 'Transferts', icon: <ArrowLeftRight className="size-4" />, permission: 'stock.view' },
     ],
   },
   {
