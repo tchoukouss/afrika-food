@@ -622,6 +622,8 @@ enum StockMovementType {
   LOSS // perte / casse / péremption…
   CONSUMPTION // consommation par une production (négatif) ou retour d'un reste (positif) — module 4
   PRODUCTION // entrée des produits fabriqués — module 4
+  SALE // sortie par une vente en caisse — module 5
+  SALE_RETURN // retour en stock (annulation / remboursement d'une vente) — module 5
 }
 
 // Journal des mouvements : en ajout seul (trigger). quantity signée :
@@ -1499,4 +1501,343 @@ model ProductionLoss {
 
   @@index([orderId])
   @@map("production_losses")
+}
+
+// ===========================================================================
+// Module 5 — Caisse & ventes.
+//
+// Aucune relation Prisma vers les modèles des modules précédents (établissements,
+// emplacements, produits, lots, utilisateurs) : clés étrangères en SQL dans la
+// migration. Montants : FCFA entiers (BigInt), prix TTC. Quantités : Decimal.
+// Rien n'est jamais supprimé ; ventes, paiements, mouvements de caisse,
+// remboursements et tickets sont protégés par des triggers.
+// ===========================================================================
+
+enum PrinterType {
+  NETWORK // imprimante thermique ESC/POS en réseau (Ethernet / Wi-Fi)
+  BROWSER // impression par le navigateur du poste
+  NONE
+}
+
+model CashRegister {
+  id              String      @id @default(uuid()) @db.Uuid
+  companyId       String      @map("company_id") @db.Uuid
+  establishmentId String      @map("establishment_id") @db.Uuid
+  code            String
+  name            String
+  // Emplacement de stock d'où sortent les produits vendus (décision 1).
+  stockLocationId String      @map("stock_location_id") @db.Uuid
+  printerType     PrinterType @default(BROWSER) @map("printer_type")
+  printerHost     String?     @map("printer_host")
+  printerPort     Int         @default(9100) @map("printer_port")
+  // Largeur du papier en mm (58 ou 80).
+  paperWidth      Int         @default(80) @map("paper_width")
+  autoPrint       Boolean     @default(true) @map("auto_print")
+  isActive        Boolean     @default(true) @map("is_active")
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  sessions CashSession[]
+
+  @@unique([establishmentId, code])
+  @@map("cash_registers")
+}
+
+enum CashSessionStatus {
+  OPEN
+  CLOSED // compté et clôturé par le caissier
+  VALIDATED // clôture validée par un responsable
+}
+
+// Session : une caisse, un caissier (décision 5).
+model CashSession {
+  id              String            @id @default(uuid()) @db.Uuid
+  companyId       String            @map("company_id") @db.Uuid
+  establishmentId String            @map("establishment_id") @db.Uuid
+  registerId      String            @map("register_id") @db.Uuid
+  number          String
+  clientRequestId String?           @map("client_request_id") @db.Uuid
+  cashierId       String            @map("cashier_id") @db.Uuid
+  status          CashSessionStatus @default(OPEN)
+  openingFloat    BigInt            @map("opening_float")
+  openedAt        DateTime          @default(now()) @map("opened_at") @db.Timestamptz(3)
+  closedAt        DateTime?         @map("closed_at") @db.Timestamptz(3)
+  closingNote     String?           @map("closing_note")
+  validatedById   String?           @map("validated_by_id") @db.Uuid
+  validatedAt     DateTime?         @map("validated_at") @db.Timestamptz(3)
+  validationNote  String?           @map("validation_note")
+  updatedAt       DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  register  CashRegister   @relation(fields: [registerId], references: [id])
+  movements CashMovement[]
+  closures  CashClosure[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@map("cash_sessions")
+}
+
+enum CashMovementType {
+  OPENING_FLOAT // fond de caisse
+  SALE // encaissement d'une vente
+  SALE_CANCEL // annulation d'une vente (négatif)
+  REFUND // remboursement (négatif)
+  MANUAL_IN // entrée manuelle autorisée
+  MANUAL_OUT // sortie manuelle autorisée (négatif)
+}
+
+// Mouvement de caisse : en ajout seul. amount signé (entrée > 0, sortie < 0).
+model CashMovement {
+  id              String           @id @default(uuid()) @db.Uuid
+  companyId       String           @map("company_id") @db.Uuid
+  establishmentId String           @map("establishment_id") @db.Uuid
+  sessionId       String           @map("session_id") @db.Uuid
+  type            CashMovementType
+  method          PaymentMethod
+  amount          BigInt
+  reason          String?
+  saleId          String?          @map("sale_id") @db.Uuid
+  returnId        String?          @map("return_id") @db.Uuid
+  clientRequestId String?          @map("client_request_id") @db.Uuid
+  userId          String           @map("user_id") @db.Uuid
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  session CashSession @relation(fields: [sessionId], references: [id])
+
+  @@unique([companyId, clientRequestId])
+  @@index([sessionId])
+  @@index([saleId])
+  @@map("cash_movements")
+}
+
+// Clôture : attendu, compté et écart par moyen de paiement.
+model CashClosure {
+  id         String        @id @default(uuid()) @db.Uuid
+  sessionId  String        @map("session_id") @db.Uuid
+  method     PaymentMethod
+  expected   BigInt
+  counted    BigInt
+  difference BigInt
+  createdAt  DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  session CashSession @relation(fields: [sessionId], references: [id])
+
+  @@unique([sessionId, method])
+  @@map("cash_closures")
+}
+
+enum SaleStatus {
+  COMPLETED
+  CANCELLED
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+model Sale {
+  id                   String     @id @default(uuid()) @db.Uuid
+  companyId            String     @map("company_id") @db.Uuid
+  establishmentId      String     @map("establishment_id") @db.Uuid
+  registerId           String     @map("register_id") @db.Uuid
+  sessionId            String     @map("session_id") @db.Uuid
+  // Numéro de ticket : unique, jamais réutilisé, attribué hors transaction (décision 13).
+  number               String
+  clientRequestId      String?    @map("client_request_id") @db.Uuid
+  status               SaleStatus @default(COMPLETED)
+  cashierId            String     @map("cashier_id") @db.Uuid
+  // Montants TTC : brut, remises (lignes + ticket), total, TVA incluse.
+  grossTotal           BigInt     @map("gross_total")
+  lineDiscountTotal    BigInt     @map("line_discount_total")
+  ticketDiscountAmount BigInt     @map("ticket_discount_amount")
+  ticketDiscountReason String?    @map("ticket_discount_reason")
+  total                BigInt
+  taxTotal             BigInt     @map("tax_total")
+  paidTotal            BigInt     @map("paid_total")
+  changeGiven          BigInt     @map("change_given")
+  // Coût réel des lots vendus (marges).
+  costTotal            Decimal    @map("cost_total") @db.Decimal(18, 2)
+  refundedTotal        BigInt     @default(0) @map("refunded_total")
+  cancelledById        String?    @map("cancelled_by_id") @db.Uuid
+  cancelledAt          DateTime?  @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason         String?    @map("cancel_reason")
+  createdAt            DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  items     SaleItem[]
+  payments  SalePayment[]
+  returns   SaleReturn[]
+  printJobs PrintJob[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, createdAt])
+  @@index([sessionId])
+  @@map("sales")
+}
+
+model SaleItem {
+  id               String  @id @default(uuid()) @db.Uuid
+  saleId           String  @map("sale_id") @db.Uuid
+  // Ordre de saisie de la ligne (ordre d'impression du ticket).
+  position         Int
+  productId        String  @map("product_id") @db.Uuid
+  // Copie au moment de la vente (le catalogue peut évoluer).
+  productCode      String  @map("product_code")
+  productName      String  @map("product_name")
+  isMenu           Boolean @default(false) @map("is_menu")
+  quantity         Decimal @db.Decimal(18, 4)
+  unitPrice        BigInt  @map("unit_price")
+  grossAmount      BigInt  @map("gross_amount")
+  discountPercent  Decimal? @map("discount_percent") @db.Decimal(5, 2)
+  lineDiscount     BigInt  @default(0) @map("line_discount")
+  discountReason   String? @map("discount_reason")
+  // Part de la remise ticket répartie sur la ligne.
+  ticketDiscount   BigInt  @default(0) @map("ticket_discount")
+  lineTotal        BigInt  @map("line_total")
+  taxRate          Decimal @map("tax_rate") @db.Decimal(5, 2)
+  taxAmount        BigInt  @map("tax_amount")
+  costTotal        Decimal @map("cost_total") @db.Decimal(18, 2)
+  refundedQuantity Decimal @default(0) @map("refunded_quantity") @db.Decimal(18, 4)
+
+  sale Sale          @relation(fields: [saleId], references: [id])
+  lots SaleItemLot[]
+
+  @@index([saleId])
+  @@index([productId])
+  @@map("sale_items")
+}
+
+// Lots sortis pour une ligne (pour un menu : lots des composants).
+model SaleItemLot {
+  id               String  @id @default(uuid()) @db.Uuid
+  saleItemId       String  @map("sale_item_id") @db.Uuid
+  productId        String  @map("product_id") @db.Uuid
+  lotId            String  @map("lot_id") @db.Uuid
+  locationId       String  @map("location_id") @db.Uuid
+  quantity         Decimal @db.Decimal(18, 4)
+  unitCost         Decimal @map("unit_cost") @db.Decimal(18, 4)
+  returnedQuantity Decimal @default(0) @map("returned_quantity") @db.Decimal(18, 4)
+
+  saleItem SaleItem @relation(fields: [saleItemId], references: [id])
+
+  @@index([saleItemId])
+  @@index([lotId])
+  @@map("sale_item_lots")
+}
+
+model SalePayment {
+  id        String        @id @default(uuid()) @db.Uuid
+  saleId    String        @map("sale_id") @db.Uuid
+  method    PaymentMethod
+  // Montant remis par le client avec ce moyen (espèces : avant rendu de monnaie).
+  amount    BigInt
+  reference String?
+  provider  String
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  sale Sale @relation(fields: [saleId], references: [id])
+
+  @@index([saleId])
+  @@map("sale_payments")
+}
+
+enum SaleReturnKind {
+  CANCEL // annulation complète dans la session ouverte
+  REFUND // remboursement (partiel ou total)
+}
+
+enum ReturnDisposition {
+  RESTOCK // remis en stock (produit intact)
+  LOSS // perte « retour client »
+}
+
+model SaleReturn {
+  id              String         @id @default(uuid()) @db.Uuid
+  companyId       String         @map("company_id") @db.Uuid
+  establishmentId String         @map("establishment_id") @db.Uuid
+  saleId          String         @map("sale_id") @db.Uuid
+  // Session d'où sort l'argent rendu.
+  sessionId       String         @map("session_id") @db.Uuid
+  number          String
+  clientRequestId String?        @map("client_request_id") @db.Uuid
+  kind            SaleReturnKind
+  method          PaymentMethod?
+  total           BigInt
+  reason          String
+  createdById     String         @map("created_by_id") @db.Uuid
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  sale  Sale             @relation(fields: [saleId], references: [id])
+  items SaleReturnItem[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([saleId])
+  @@map("sale_returns")
+}
+
+model SaleReturnItem {
+  id          String            @id @default(uuid()) @db.Uuid
+  returnId    String            @map("return_id") @db.Uuid
+  saleItemId  String            @map("sale_item_id") @db.Uuid
+  quantity    Decimal           @db.Decimal(18, 4)
+  amount      BigInt
+  disposition ReturnDisposition
+
+  saleReturn SaleReturn      @relation(fields: [returnId], references: [id])
+  lots       SaleReturnLot[]
+
+  @@index([returnId])
+  @@map("sale_return_items")
+}
+
+// Lots concernés par un retour : remis en stock (mouvement SALE_RETURN) ou
+// sortis en perte « retour client » (stock_loss_id).
+model SaleReturnLot {
+  id           String            @id @default(uuid()) @db.Uuid
+  returnItemId String            @map("return_item_id") @db.Uuid
+  saleItemLotId String           @map("sale_item_lot_id") @db.Uuid
+  productId    String            @map("product_id") @db.Uuid
+  lotId        String            @map("lot_id") @db.Uuid
+  locationId   String            @map("location_id") @db.Uuid
+  quantity     Decimal           @db.Decimal(18, 4)
+  disposition  ReturnDisposition
+  stockLossId  String?           @map("stock_loss_id") @db.Uuid
+
+  returnItem SaleReturnItem @relation(fields: [returnItemId], references: [id])
+
+  @@index([returnItemId])
+  @@index([lotId])
+  @@map("sale_return_lots")
+}
+
+enum PrintJobKind {
+  TICKET // impression originale
+  DUPLICATE // réimpression (mention DUPLICATA), jamais une nouvelle vente
+}
+
+enum PrintJobStatus {
+  PENDING
+  PRINTED // envoyé à l'imprimante réseau
+  BROWSER // rendu pour impression par le navigateur
+  FAILED
+}
+
+model PrintJob {
+  id              String         @id @default(uuid()) @db.Uuid
+  companyId       String         @map("company_id") @db.Uuid
+  establishmentId String         @map("establishment_id") @db.Uuid
+  registerId      String?        @map("register_id") @db.Uuid
+  saleId          String         @map("sale_id") @db.Uuid
+  kind            PrintJobKind
+  status          PrintJobStatus @default(PENDING)
+  attempts        Int            @default(0)
+  lastError       String?        @map("last_error")
+  requestedById   String         @map("requested_by_id") @db.Uuid
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  printedAt       DateTime?      @map("printed_at") @db.Timestamptz(3)
+
+  sale Sale @relation(fields: [saleId], references: [id])
+
+  @@index([saleId])
+  @@map("print_jobs")
 }

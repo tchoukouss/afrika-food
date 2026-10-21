@@ -182,3 +182,73 @@ quel.
 | Planifier, modifier, valider, lancer, terminer, annuler | production.manage | Admin, Directeur, Responsable, Resp. production, Chef de cuisine |
 | Contrôler (autre que celui qui a terminé) | inventory.validate | Admin, Directeur, Responsable |
 | Traçabilité d'un lot | stock.view (lot passé par l'établissement) | Admin, Directeur, Responsable, Resp. achats, Magasinier, Resp. production, Chef de cuisine |
+
+## Module 5 — Caisse & ventes
+
+Décisions validées le 23/10/2026 :
+
+| # | Sujet | Règle |
+|---|---|---|
+| 1 | Stock vendu | Chaque caisse est liée à un emplacement de son établissement (Magasin principal par défaut). |
+| 2 | Stock insuffisant | Vente refusée ; jamais de stock négatif. |
+| 3 | Fabrication à la commande | Hors module 5 (module 6). |
+| 4 | Menus | Vendus à leur propre prix ; leurs composants sortent du stock et donnent le coût réel. |
+| 5 | Session | Une session = une caisse = un caissier (index uniques partiels). |
+| 6 | Clôture | Le caissier compte et clôture ; un responsable (autre que le caissier) valide ; écart enregistré, non bloquant. |
+| 7 | Annulation / remboursement | Rien n'est supprimé : retour numéroté, mouvements inverses, audit. Annulation seulement dans la session encore ouverte ; ensuite remboursement. |
+| 8 | Remises | % ou montant, par ligne ou sur le ticket, avec permission et motif obligatoire ; sans plafond. |
+| 9 | Prix | Non modifiable à la caisse (prix local, sinon prix de base). |
+| 10 | Mobile money | Référence saisie après confirmation ; abstraction de prestataire prête pour une intégration API. |
+| 11 | Paiements | Plusieurs moyens ; monnaie rendue uniquement sur les espèces. |
+| 12 | Impression | Imprimante thermique réseau (ESC/POS, port 9100) ; repli navigateur ; pas d'USB. |
+| 13 | Numéro de ticket | Unique, jamais réutilisé, séquence monotone et traçable ; attribué hors transaction : un numéro attribué à une vente qui échoue est tracé (audit SALE_NUMBER_VOIDED), sans garantie d'absence de trou. |
+| 14 | Crédit client | Hors module 5 (module 7). |
+| 15 | Paiement fournisseur en caisse | Hors module 5 (module 8) ; sortie manuelle d'espèces avec motif disponible. |
+| 16 | Hors ligne | Non. |
+| 17 | Configuration des caisses | Responsable de l'établissement (permissions existantes). |
+| 18 | TVA | Prix TTC sur le ticket, détail HT / TVA par taux quand des produits y sont soumis. |
+
+Flux d'une vente (une transaction) : verrou de la session, verrou des soldes
+des produits vendus en une requête triée, sortie par le moteur de stock du
+module 3 (mouvements SALE, FEFO, lots périmés exclus, réservé jamais entamé,
+inventaire en cours bloquant), lignes et lots vendus, paiements, mouvements de
+caisse, audit, travail d'impression. L'impression réseau a lieu après la
+validation : une imprimante éteinte ne bloque jamais la vente (ticket en échec,
+relance ou repli navigateur).
+
+Retours : annulation et remboursement remettent en stock les mêmes lots
+(mouvements SALE_RETURN) ou déclarent une perte « retour client » ; le
+remboursement est prorata, la dernière unité solde exactement la ligne, et peut
+être réparti entre les moyens de paiement de la vente, chacun dans la limite de
+ce qu'il a encaissé.
+
+Protection en base : ventes, lignes, lots vendus, sessions et tickets ne se
+mettent à jour que sur leurs colonnes d'état (trigger `only_columns_update`) ;
+paiements, mouvements de caisse, clôtures et retours en ajout seul ; rien ne se
+supprime. Adresse d'imprimante limitée au réseau local.
+
+Traçabilité : vente → lots vendus → production → matières et fournisseurs
+(réutilise la traçabilité du module 4) ; lot → produits finis fabriqués avec
+lui → tickets.
+
+Modules précédents : seules les valeurs SALE et SALE_RETURN ont été ajoutées
+aux mouvements du module 3 ; moteur de stock, numérotation, audit, anti double
+envoi et traçabilité réutilisés tels quels.
+
+### Droits du module 5 par rôle
+
+| Action | Permission | Rôles par défaut |
+|---|---|---|
+| Ouvrir, compter et clôturer sa session ; relancer une impression | cash.operate | Responsable, Caissier |
+| Vendre | sales.create | Responsable, Caissier |
+| Remise | sales.discount | Responsable |
+| Annuler une vente | sales.cancel | Responsable |
+| Rembourser (depuis sa propre session ouverte) | sales.refund | Responsable |
+| Réimprimer un duplicata | tickets.reprint | Responsable |
+| Entrées / sorties manuelles d'espèces | cash.movements | Responsable |
+| Voir toutes les sessions et rapports Z | cash.view_all | Responsable, Comptable |
+| Valider une clôture ; configurer les caisses | cash.view_all + cash.movements | Responsable |
+| Voir les ventes | sales.view | Responsable, Caissier, Comptable |
+| Traçabilité amont d'une vente | stock.view | Responsable, Magasinier, Resp. achats, production |
+
+(Admin et Directeur détiennent toutes ces permissions au niveau groupe.)

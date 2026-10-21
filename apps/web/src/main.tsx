@@ -16,6 +16,10 @@ import { CostingPage } from './pages/production/Costing';
 import { ProductionPage } from './pages/production/Production';
 import { RecipesPage } from './pages/production/Recipes';
 import { TraceabilityPage } from './pages/production/Traceability';
+import { PosPage } from './pages/sales/Pos';
+import { RegistersPage } from './pages/sales/Registers';
+import { SalesPage } from './pages/sales/Sales';
+import { SessionsPage } from './pages/sales/Sessions';
 import { InventoryPage } from './pages/stock/Inventory';
 import { PurchaseRequestsPage, PurchasesPage } from './pages/stock/Purchases';
 import { StockPage } from './pages/stock/Stock';
@@ -70,6 +74,10 @@ function App() {
         <Route path="recettes" element={<RecipesPage />} />
         <Route path="couts-marges" element={<CostingPage />} />
         <Route path="tracabilite" element={<TraceabilityPage />} />
+        <Route path="caisse" element={<PosPage />} />
+        <Route path="sessions-caisse" element={<SessionsPage />} />
+        <Route path="ventes" element={<SalesPage />} />
+        <Route path="caisses" element={<RegistersPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
