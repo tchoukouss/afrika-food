@@ -16,6 +16,12 @@ import { CostingPage } from './pages/production/Costing';
 import { ProductionPage } from './pages/production/Production';
 import { RecipesPage } from './pages/production/Recipes';
 import { TraceabilityPage } from './pages/production/Traceability';
+import { FloorPage } from './pages/restaurant/Floor';
+import { KitchenPage } from './pages/restaurant/Kitchen';
+import { OrderPage } from './pages/restaurant/Order';
+import { OrdersPage } from './pages/restaurant/Orders';
+import { ReservationsPage } from './pages/restaurant/Reservations';
+import { RestaurantSetupPage } from './pages/restaurant/Setup';
 import { PosPage } from './pages/sales/Pos';
 import { RegistersPage } from './pages/sales/Registers';
 import { SalesPage } from './pages/sales/Sales';
@@ -78,6 +84,12 @@ function App() {
         <Route path="sessions-caisse" element={<SessionsPage />} />
         <Route path="ventes" element={<SalesPage />} />
         <Route path="caisses" element={<RegistersPage />} />
+        <Route path="salle" element={<FloorPage />} />
+        <Route path="commandes" element={<OrdersPage />} />
+        <Route path="commandes/:id" element={<OrderPage />} />
+        <Route path="cuisine" element={<KitchenPage />} />
+        <Route path="reservations" element={<ReservationsPage />} />
+        <Route path="restaurant-parametres" element={<RestaurantSetupPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

@@ -10,6 +10,8 @@ export interface TicketData {
   establishment: { name: string; address: string | null; city: string | null; phone: string | null; receiptHeader: string | null; receiptFooter: string | null };
   register: { name: string } | null;
   number: string;
+  /** Mention complémentaire, ex. numéro de commande restaurant et table. */
+  reference?: string | null;
   createdAt: Date;
   cashier: string | null;
   status: string;
@@ -81,6 +83,7 @@ export function renderTicket(t: TicketData, opts: { width: number; duplicate?: b
   if (opts.duplicate) center('*** DUPLICATA ***');
   if (t.status === 'CANCELLED') center('*** VENTE ANNULÉE ***');
   lr(`Ticket ${t.number}`, '');
+  if (t.reference) lines.push(t.reference.slice(0, W));
   lr(dateText(t.createdAt), t.register?.name ?? '');
   if (t.cashier) lines.push(`Caissier : ${t.cashier}`.slice(0, W));
   rule();

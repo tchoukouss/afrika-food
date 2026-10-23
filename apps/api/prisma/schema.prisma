@@ -624,6 +624,8 @@ enum StockMovementType {
   PRODUCTION // entrée des produits fabriqués — module 4
   SALE // sortie par une vente en caisse — module 5
   SALE_RETURN // retour en stock (annulation / remboursement d'une vente) — module 5
+  ORDER_CONSUMPTION // sortie à l'envoi en cuisine / au bar d'une commande restaurant — module 6
+  ORDER_RETURN // retour en stock d'un article annulé avant préparation — module 6
 }
 
 // Journal des mouvements : en ajout seul (trigger). quantity signée :
@@ -1840,4 +1842,400 @@ model PrintJob {
 
   @@index([saleId])
   @@map("print_jobs")
+}
+
+// ===========================================================================
+// Module 6 — Restaurant & commandes.
+//
+// Aucune relation Prisma vers les modèles des modules précédents : clés
+// étrangères en SQL dans la migration. Prix TTC en FCFA (BigInt), quantités en
+// Decimal. Rien n'est jamais supprimé (triggers) : articles retirés, annulés,
+// transférés ou regroupés restent dans l'historique.
+// ===========================================================================
+
+model RestaurantArea {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  name            String
+  sortOrder       Int      @default(0) @map("sort_order")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tables RestaurantTable[]
+
+  @@unique([establishmentId, name])
+  @@map("restaurant_areas")
+}
+
+// État posé à la main ; le statut affiché (libre, réservée, attente de
+// commande, occupée, attente d'addition) est calculé à partir des commandes
+// et des réservations (décision R8).
+enum TableState {
+  AVAILABLE
+  CLEANING // nettoyage (posé automatiquement après paiement complet)
+  OUT_OF_SERVICE // hors service
+}
+
+model RestaurantTable {
+  id              String     @id @default(uuid()) @db.Uuid
+  companyId       String     @map("company_id") @db.Uuid
+  establishmentId String     @map("establishment_id") @db.Uuid
+  areaId          String     @map("area_id") @db.Uuid
+  code            String
+  capacity        Int
+  state           TableState @default(AVAILABLE)
+  sortOrder       Int        @default(0) @map("sort_order")
+  isActive        Boolean    @default(true) @map("is_active")
+  createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  area RestaurantArea @relation(fields: [areaId], references: [id])
+
+  @@unique([establishmentId, code])
+  @@map("restaurant_tables")
+}
+
+enum StationKind {
+  KITCHEN
+  BAR
+}
+
+// Poste de préparation : emplacement de stock consommé et imprimante de bons.
+model RestaurantStation {
+  id              String      @id @default(uuid()) @db.Uuid
+  companyId       String      @map("company_id") @db.Uuid
+  establishmentId String      @map("establishment_id") @db.Uuid
+  name            String
+  kind            StationKind
+  stockLocationId String      @map("stock_location_id") @db.Uuid
+  printerType     PrinterType @default(NONE) @map("printer_type")
+  printerHost     String?     @map("printer_host")
+  printerPort     Int         @default(9100) @map("printer_port")
+  paperWidth      Int         @default(80) @map("paper_width")
+  isActive        Boolean     @default(true) @map("is_active")
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([establishmentId, name])
+  @@map("restaurant_stations")
+}
+
+enum PreparationMode {
+  TO_ORDER // préparé à la commande : la recette est consommée à l'envoi
+  FROM_STOCK // produit fini sorti du stock à l'envoi
+}
+
+// Carte du restaurant d'un établissement (décision R5).
+model RestaurantMenuItem {
+  id              String          @id @default(uuid()) @db.Uuid
+  companyId       String          @map("company_id") @db.Uuid
+  establishmentId String          @map("establishment_id") @db.Uuid
+  productId       String          @map("product_id") @db.Uuid
+  preparation     PreparationMode @default(FROM_STOCK)
+  stationId       String?         @map("station_id") @db.Uuid
+  isSupplement    Boolean         @default(false) @map("is_supplement")
+  sortOrder       Int             @default(0) @map("sort_order")
+  isActive        Boolean         @default(true) @map("is_active")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([establishmentId, productId])
+  @@map("restaurant_menu_items")
+}
+
+// Options sans prix ni stock (ex. « cuisson : à point »).
+model RestaurantOption {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  productId       String   @map("product_id") @db.Uuid
+  label           String
+  sortOrder       Int      @default(0) @map("sort_order")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([establishmentId, productId, label])
+  @@map("restaurant_options")
+}
+
+enum RestaurantOrderMode {
+  TABLE
+  COUNTER // comptoir
+  TAKEAWAY // à emporter
+  PHONE // téléphone
+  ONLINE // en ligne (saisie manuelle)
+  DELIVERY // livraison (suivi complet au module 7)
+}
+
+enum RestaurantOrderStatus {
+  OPEN
+  PAID // soldée
+  CANCELLED
+  MERGED // regroupée dans une autre commande
+}
+
+model RestaurantOrder {
+  id              String                @id @default(uuid()) @db.Uuid
+  companyId       String                @map("company_id") @db.Uuid
+  establishmentId String                @map("establishment_id") @db.Uuid
+  number          String
+  clientRequestId String?               @map("client_request_id") @db.Uuid
+  mode            RestaurantOrderMode
+  tableId         String?               @map("table_id") @db.Uuid
+  reservationId   String?               @map("reservation_id") @db.Uuid
+  covers          Int?
+  customerName    String?               @map("customer_name")
+  customerPhone   String?               @map("customer_phone")
+  deliveryAddress String?               @map("delivery_address")
+  expectedAt      DateTime?             @map("expected_at") @db.Timestamptz(3)
+  urgent          Boolean               @default(false)
+  note            String?
+  status          RestaurantOrderStatus @default(OPEN)
+  waiterId        String                @map("waiter_id") @db.Uuid
+  mergedIntoId    String?               @map("merged_into_id") @db.Uuid
+  paidAt          DateTime?             @map("paid_at") @db.Timestamptz(3)
+  cancelledAt     DateTime?             @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById   String?               @map("cancelled_by_id") @db.Uuid
+  cancelReason    String?               @map("cancel_reason")
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items          RestaurantOrderItem[]
+  kitchenTickets RestaurantKitchenTicket[]
+  bills          RestaurantBill[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@map("restaurant_orders")
+}
+
+enum RestaurantItemStatus {
+  DRAFT // saisi, pas encore envoyé (modifiable)
+  REMOVED // brouillon retiré (conservé)
+  NEW // envoyé, reçu en cuisine
+  IN_PREPARATION
+  READY
+  SERVED
+  CANCELLED // entièrement annulé après envoi
+}
+
+model RestaurantOrderItem {
+  id                String               @id @default(uuid()) @db.Uuid
+  orderId           String               @map("order_id") @db.Uuid
+  position          Int
+  requestId         String?              @map("request_id") @db.Uuid
+  productId         String               @map("product_id") @db.Uuid
+  // Copie au moment de la saisie : le client paie le prix annoncé (décision R7).
+  productCode       String               @map("product_code")
+  productName       String               @map("product_name")
+  isMenu            Boolean              @default(false) @map("is_menu")
+  unitPrice         BigInt               @map("unit_price")
+  taxRate           Decimal              @map("tax_rate") @db.Decimal(5, 2)
+  quantity          Decimal              @db.Decimal(18, 4)
+  note              String?
+  options           String[]             @default([])
+  // Supplément rattaché à un article.
+  parentItemId      String?              @map("parent_item_id") @db.Uuid
+  preparation       PreparationMode
+  stationId         String?              @map("station_id") @db.Uuid
+  status            RestaurantItemStatus @default(DRAFT)
+  kitchenTicketId   String?              @map("kitchen_ticket_id") @db.Uuid
+  cancelledQuantity Decimal              @default(0) @map("cancelled_quantity") @db.Decimal(18, 4)
+  // Coût réel des lots consommés, net des retours et des pertes.
+  costTotal         Decimal              @default(0) @map("cost_total") @db.Decimal(18, 2)
+  // Addition en cours ou payée qui couvre l'article.
+  billId            String?              @map("bill_id") @db.Uuid
+  createdById       String               @map("created_by_id") @db.Uuid
+  sentById          String?              @map("sent_by_id") @db.Uuid
+  sentAt            DateTime?            @map("sent_at") @db.Timestamptz(3)
+  statusChangedAt   DateTime             @default(now()) @map("status_changed_at") @db.Timestamptz(3)
+  statusChangedById String?              @map("status_changed_by_id") @db.Uuid
+  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  order        RestaurantOrder         @relation(fields: [orderId], references: [id])
+  consumptions RestaurantConsumption[]
+
+  @@index([orderId])
+  @@index([kitchenTicketId])
+  @@index([billId])
+  @@map("restaurant_order_items")
+}
+
+// Bon de cuisine / de bar : articles envoyés ensemble à un poste.
+model RestaurantKitchenTicket {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  orderId         String   @map("order_id") @db.Uuid
+  stationId       String?  @map("station_id") @db.Uuid
+  number          String
+  requestId       String?  @map("request_id") @db.Uuid
+  urgent          Boolean  @default(false)
+  sentById        String   @map("sent_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  order RestaurantOrder @relation(fields: [orderId], references: [id])
+
+  @@unique([companyId, number])
+  @@index([establishmentId, createdAt])
+  @@map("restaurant_kitchen_tickets")
+}
+
+enum OrderConsumptionKind {
+  CONSUMED // sorti du stock à l'envoi
+  RETURNED // rendu au même lot (annulation avant préparation)
+  LOST // perte déclarée (annulation après préparation)
+}
+
+// Lots consommés par un article (traçabilité jusqu'aux matières premières).
+model RestaurantConsumption {
+  id             String          @id @default(uuid()) @db.Uuid
+  itemId         String          @map("item_id") @db.Uuid
+  kind           OrderConsumptionKind
+  rawMaterialId  String?         @map("raw_material_id") @db.Uuid
+  productId      String?         @map("product_id") @db.Uuid
+  lotId          String          @map("lot_id") @db.Uuid
+  locationId     String          @map("location_id") @db.Uuid
+  quantity       Decimal         @db.Decimal(18, 4)
+  unitCost       Decimal         @map("unit_cost") @db.Decimal(18, 4)
+  value          Decimal         @db.Decimal(18, 2)
+  cancellationId String?         @map("cancellation_id") @db.Uuid
+  stockLossId    String?         @map("stock_loss_id") @db.Uuid
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  item RestaurantOrderItem @relation(fields: [itemId], references: [id])
+
+  @@index([itemId])
+  @@index([lotId])
+  @@map("restaurant_consumptions")
+}
+
+// Annulation (totale ou partielle) d'un article déjà envoyé (décision R14).
+model RestaurantItemCancellation {
+  id              String            @id @default(uuid()) @db.Uuid
+  companyId       String            @map("company_id") @db.Uuid
+  establishmentId String            @map("establishment_id") @db.Uuid
+  clientRequestId String?           @map("client_request_id") @db.Uuid
+  itemId          String            @map("item_id") @db.Uuid
+  quantity        Decimal           @db.Decimal(18, 4)
+  outcome         ReturnDisposition
+  lossCause       LossCause?        @map("loss_cause")
+  reason          String
+  statusAtCancel  RestaurantItemStatus @map("status_at_cancel")
+  createdById     String            @map("created_by_id") @db.Uuid
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, clientRequestId])
+  @@index([itemId])
+  @@map("restaurant_item_cancellations")
+}
+
+enum RestaurantBillStatus {
+  OPEN // addition préparée, non payée
+  PAID // encaissée : ticket du module 5
+  CANCELLED // annulée avant paiement, ou ticket annulé (lignes rouvertes)
+}
+
+model RestaurantBill {
+  id              String               @id @default(uuid()) @db.Uuid
+  companyId       String               @map("company_id") @db.Uuid
+  establishmentId String               @map("establishment_id") @db.Uuid
+  orderId         String               @map("order_id") @db.Uuid
+  number          String
+  clientRequestId String?              @map("client_request_id") @db.Uuid
+  status          RestaurantBillStatus @default(OPEN)
+  total           BigInt
+  printCount      Int                  @default(0) @map("print_count")
+  saleId          String?              @map("sale_id") @db.Uuid
+  paidAt          DateTime?            @map("paid_at") @db.Timestamptz(3)
+  createdById     String               @map("created_by_id") @db.Uuid
+  cancelledAt     DateTime?            @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById   String?              @map("cancelled_by_id") @db.Uuid
+  cancelReason    String?              @map("cancel_reason")
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  order RestaurantOrder      @relation(fields: [orderId], references: [id])
+  items RestaurantBillItem[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@unique([saleId])
+  @@index([orderId])
+  @@map("restaurant_bills")
+}
+
+// Contenu figé d'une addition.
+model RestaurantBillItem {
+  id        String  @id @default(uuid()) @db.Uuid
+  billId    String  @map("bill_id") @db.Uuid
+  itemId    String  @map("item_id") @db.Uuid
+  quantity  Decimal @db.Decimal(18, 4)
+  unitPrice BigInt  @map("unit_price")
+  amount    BigInt
+
+  bill RestaurantBill @relation(fields: [billId], references: [id])
+
+  @@index([billId])
+  @@index([itemId])
+  @@map("restaurant_bill_items")
+}
+
+enum ReservationStatus {
+  CONFIRMED
+  SEATED // client arrivé
+  NO_SHOW // non venu
+  CANCELLED
+}
+
+model RestaurantReservation {
+  id              String            @id @default(uuid()) @db.Uuid
+  companyId       String            @map("company_id") @db.Uuid
+  establishmentId String            @map("establishment_id") @db.Uuid
+  clientRequestId String?           @map("client_request_id") @db.Uuid
+  tableId         String?           @map("table_id") @db.Uuid
+  reservedAt      DateTime          @map("reserved_at") @db.Timestamptz(3)
+  covers          Int
+  name            String
+  phone           String?
+  note            String?
+  status          ReservationStatus @default(CONFIRMED)
+  createdById     String            @map("created_by_id") @db.Uuid
+  statusChangedAt DateTime?         @map("status_changed_at") @db.Timestamptz(3)
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, reservedAt])
+  @@map("restaurant_reservations")
+}
+
+enum RestaurantPrintKind {
+  KITCHEN // bon de cuisine / bar
+  BILL // addition provisoire (pas un ticket de caisse)
+}
+
+model RestaurantPrintJob {
+  id              String              @id @default(uuid()) @db.Uuid
+  companyId       String              @map("company_id") @db.Uuid
+  establishmentId String              @map("establishment_id") @db.Uuid
+  kind            RestaurantPrintKind
+  kitchenTicketId String?             @map("kitchen_ticket_id") @db.Uuid
+  billId          String?             @map("bill_id") @db.Uuid
+  stationId       String?             @map("station_id") @db.Uuid
+  registerId      String?             @map("register_id") @db.Uuid
+  status          PrintJobStatus      @default(PENDING)
+  attempts        Int                 @default(0)
+  lastError       String?             @map("last_error")
+  requestedById   String              @map("requested_by_id") @db.Uuid
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  printedAt       DateTime?           @map("printed_at") @db.Timestamptz(3)
+
+  @@index([kitchenTicketId])
+  @@index([billId])
+  @@map("restaurant_print_jobs")
 }

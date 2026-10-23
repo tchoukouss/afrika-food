@@ -17,5 +17,7 @@ import { CashSessionsController, CashSessionsService } from './sessions';
 @Module({
   controllers: [RegistersController, CashSessionsController, SalesController],
   providers: [AuditService, StockEngine, SequenceService, CostingService, ProductionService, NetworkPrinter, RegistersService, CashSessionsService, SalesService],
+  // Encaissement des additions du restaurant (module 6).
+  exports: [SalesService],
 })
 export class SalesModule {}

@@ -14,6 +14,7 @@ import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 import { RequestContextMiddleware } from './common/request-context.middleware';
 import { CatalogModule } from './catalog/catalog.module';
 import { ProductionModule } from './production/production.module';
+import { RestaurantModule } from './restaurant/restaurant.module';
 import { SalesModule } from './sales/sales.module';
 import { StockModule } from './stock/stock.module';
 import { CompanyController, CompanyService } from './company/company';
@@ -47,6 +48,7 @@ class HealthController {
     StockModule,
     ProductionModule,
     SalesModule,
+    RestaurantModule,
     JwtModule.register({}),
     // Limite globale par IP ; des limites plus strictes s'appliquent à la connexion.
     ThrottlerModule.forRoot({

@@ -133,7 +133,47 @@ interface PricedLine {
   taxAmount: bigint;
   /** Articles réellement sortis du stock : le produit, ou les composants d'un menu (décision 4). */
   parts: { productId: string; name: string; quantity: Prisma.Decimal }[];
+  /** Coût réel déjà connu : articles sortis du stock avant l'encaissement (restaurant, module 6). */
+  presetCost?: Prisma.Decimal;
 }
+
+type Priced = Awaited<ReturnType<SalesService['finishPricing']>>;
+
+/**
+ * Ligne d'une addition du restaurant (module 6) : prix figé à la commande et
+ * stock déjà sorti à l'envoi en cuisine. Réservé à l'appel interne : le
+ * formulaire de caisse ne peut jamais fournir un prix (décision 9).
+ */
+export interface PresetSaleLine {
+  productId: string;
+  productCode: string;
+  productName: string;
+  isMenu: boolean;
+  quantity: Prisma.Decimal;
+  unitPrice: bigint;
+  taxRate: Prisma.Decimal;
+  costTotal: Prisma.Decimal;
+  discountPercent?: number;
+  discountAmount?: number;
+  discountReason?: string | null;
+}
+
+export interface PresetSaleInput {
+  sessionId: string;
+  clientRequestId?: string;
+  lines: PresetSaleLine[];
+  ticketDiscountPercent?: number;
+  ticketDiscountAmount?: number;
+  ticketDiscountReason?: string | null;
+  payments: PaymentDto[];
+  /** Mention imprimée sur le ticket, ex. « Commande PLT-RST-2026-000004 — Table 12 ». */
+  reference: string;
+  /** Exécuté dans la transaction de la vente (ex. marquer l'addition payée). */
+  inTransaction: (tx: Tx, saleId: string) => Promise<void>;
+}
+
+/** Appelé dans la transaction d'annulation d'une vente (module 6 : rouvrir l'addition). */
+export type SaleCancelHook = (tx: Tx, me: AuthUser, sale: Sale) => Promise<void>;
 
 const discountOf = (base: bigint, percent?: number, amount?: number) => {
   if (percent !== undefined && amount !== undefined) throw new BadRequestException('Remise : indiquer un pourcentage OU un montant');
@@ -152,6 +192,18 @@ export class SalesService {
     private readonly printer: NetworkPrinter,
     private readonly production: ProductionService,
   ) {}
+
+  private readonly ticketReferences: ((saleId: string) => Promise<string | null>)[] = [];
+  private readonly cancelHooks: SaleCancelHook[] = [];
+
+  /** Mention ajoutée au ticket d'une vente (ex. numéro de commande restaurant). */
+  registerTicketReference(resolver: (saleId: string) => Promise<string | null>) {
+    this.ticketReferences.push(resolver);
+  }
+
+  registerCancelHook(hook: SaleCancelHook) {
+    this.cancelHooks.push(hook);
+  }
 
   // --- Calcul du ticket --------------------------------------------------------------
 
@@ -211,7 +263,48 @@ export class SalesService {
         parts,
       });
     }
+    return this.finishPricing(lines, anyDiscount, dto);
+  }
 
+  /** Lignes d'une addition du restaurant : prix figés, remises soumises aux mêmes règles. */
+  private presetLines(lines: PresetSaleLine[], dto: Pick<PresetSaleInput, 'ticketDiscountPercent' | 'ticketDiscountAmount' | 'ticketDiscountReason'>) {
+    let anyDiscount = false;
+    const priced: PricedLine[] = lines.map((l) => {
+      const grossAmount = roundXof(big(l.unitPrice).mul(l.quantity));
+      const disc = discountOf(grossAmount, l.discountPercent, l.discountAmount);
+      if (disc.value > grossAmount) throw new BadRequestException(`Remise supérieure au montant de « ${l.productName} »`);
+      if (disc.value > 0n) {
+        anyDiscount = true;
+        if (!l.discountReason || l.discountReason.length < 3) throw new BadRequestException(`Motif de remise obligatoire pour « ${l.productName} »`);
+      }
+      return {
+        productId: l.productId,
+        productCode: l.productCode,
+        productName: l.productName,
+        isMenu: l.isMenu,
+        quantity: l.quantity,
+        unitPrice: l.unitPrice,
+        grossAmount,
+        discountPercent: disc.percent,
+        lineDiscount: disc.value,
+        discountReason: disc.value > 0n ? l.discountReason ?? null : null,
+        ticketDiscount: 0n,
+        lineTotal: 0n,
+        taxRate: l.taxRate,
+        taxAmount: 0n,
+        parts: [],
+        presetCost: l.costTotal,
+      };
+    });
+    return this.finishPricing(priced, anyDiscount, dto);
+  }
+
+  private finishPricing(
+    lines: PricedLine[],
+    lineDiscounts: boolean,
+    dto: { ticketDiscountPercent?: number; ticketDiscountAmount?: number; ticketDiscountReason?: string | null },
+  ) {
+    let anyDiscount = lineDiscounts;
     // Remise ticket, répartie au prorata des lignes (reste d'arrondi sur les plus grosses).
     const subtotal = lines.reduce((s, l) => s + l.grossAmount - l.lineDiscount, 0n);
     const ticket = discountOf(subtotal, dto.ticketDiscountPercent, dto.ticketDiscountAmount);
@@ -279,12 +372,49 @@ export class SalesService {
         this.prisma.sale
           .findFirst({ where: { companyId: me.companyId, clientRequestId: dto.clientRequestId } })
           .then((s) => s && { id: s.id, ownerId: s.cashierId }),
-      () => this.doCreate(me, dto),
+      () => this.recordSale(me, { sessionId: dto.sessionId, clientRequestId: dto.clientRequestId, payments: dto.payments, price: (estId) => this.priceLines(me, estId, dto) }),
       (id) => this.saleResult(me, id, null),
     );
   }
 
-  private async doCreate(me: AuthUser, dto: CreateSaleDto) {
+  /**
+   * Encaissement d'une addition du restaurant (module 6) par le même circuit que
+   * la caisse : session, paiements, remises, TVA, mouvements de caisse, ticket,
+   * impression et audit. Aucune nouvelle sortie de stock (déjà faite à l'envoi
+   * en cuisine) : le coût réel est fourni par le module 6.
+   */
+  createPresetSale(me: AuthUser, input: PresetSaleInput) {
+    return idempotent(
+      me,
+      input.clientRequestId,
+      () =>
+        this.prisma.sale
+          .findFirst({ where: { companyId: me.companyId, clientRequestId: input.clientRequestId } })
+          .then((s) => s && { id: s.id, ownerId: s.cashierId }),
+      () =>
+        this.recordSale(me, {
+          sessionId: input.sessionId,
+          clientRequestId: input.clientRequestId,
+          payments: input.payments,
+          price: async () => this.presetLines(input.lines, input),
+          reference: input.reference,
+          inTransaction: input.inTransaction,
+        }),
+      (id) => this.saleResult(me, id, null),
+    );
+  }
+
+  private async recordSale(
+    me: AuthUser,
+    dto: {
+      sessionId: string;
+      clientRequestId?: string;
+      payments: PaymentDto[];
+      price: (establishmentId: string) => Promise<Priced>;
+      reference?: string;
+      inTransaction?: (tx: Tx, saleId: string) => Promise<void>;
+    },
+  ) {
     // Contrôles préalables, avant d'attribuer un numéro de ticket.
     const session = await this.prisma.cashSession.findFirst({ where: { id: dto.sessionId, companyId: me.companyId }, include: { register: true } });
     if (!session) throw new NotFoundException('Session de caisse introuvable');
@@ -292,7 +422,7 @@ export class SalesService {
     if (session.cashierId !== me.userId) throw new ForbiddenException('Cette session de caisse appartient à un autre caissier');
     if (session.status !== 'OPEN') throw new ConflictException('Session de caisse clôturée');
     if (!session.register.isActive) throw new ConflictException('Caisse désactivée');
-    const priced = await this.priceLines(me, session.establishmentId, dto);
+    const priced = await dto.price(session.establishmentId);
     if (priced.anyDiscount) assertCan(me, session.establishmentId, 'sales.discount');
     const pay = this.checkPayments(priced.total, dto.payments);
     const est = await this.prisma.establishment.findUniqueOrThrow({ where: { id: session.establishmentId } });
@@ -313,11 +443,13 @@ export class SalesService {
 
         // Verrouillage de tous les soldes concernés en une requête, dans l'ordre des identifiants (pas d'interblocage).
         const productIds = [...new Set(priced.lines.flatMap((l) => l.parts.map((p) => p.productId)))];
-        await this.engine.assertNotFrozen(tx, locationId);
-        await tx.$queryRaw`
-          SELECT id FROM stock_balances
-          WHERE location_id = ${locationId}::uuid AND product_id IN (${Prisma.join(productIds.map((id) => Prisma.sql`${id}::uuid`))})
-          ORDER BY id FOR UPDATE`;
+        if (productIds.length) {
+          await this.engine.assertNotFrozen(tx, locationId);
+          await tx.$queryRaw`
+            SELECT id FROM stock_balances
+            WHERE location_id = ${locationId}::uuid AND product_id IN (${Prisma.join(productIds.map((id) => Prisma.sql`${id}::uuid`))})
+            ORDER BY id FOR UPDATE`;
+        }
 
         // Sortie du stock par le moteur du module 3 : FEFO, lots périmés exclus, réservations respectées (décision 2).
         const issued = [];
@@ -327,7 +459,7 @@ export class SalesService {
             const out = await this.engine.issue(tx, ctx, { rawMaterialId: null, productId: part.productId }, part.quantity, { itemName: part.name });
             lots.push(...out.map((o) => ({ ...o, productId: part.productId })));
           }
-          issued.push({ line, lots, cost: lots.reduce((sum, o) => sum.add(o.value), D(0)) });
+          issued.push({ line, lots, cost: line.presetCost ?? lots.reduce((sum, o) => sum.add(o.value), D(0)) });
         }
         const costTotal = issued.reduce((sum, i) => sum.add(i.cost), D(0));
 
@@ -353,11 +485,13 @@ export class SalesService {
           },
         });
         for (const [position, { line, lots, cost }] of issued.entries()) {
-          const { parts: _parts, ...data } = line;
+          const { parts: _parts, presetCost: _cost, ...data } = line;
           const item = await tx.saleItem.create({ data: { ...data, saleId, position, costTotal: cost } });
-          await tx.saleItemLot.createMany({
-            data: lots.map((o) => ({ saleItemId: item.id, productId: o.productId, lotId: o.lotId, locationId, quantity: o.quantity, unitCost: o.unitCost })),
-          });
+          if (lots.length) {
+            await tx.saleItemLot.createMany({
+              data: lots.map((o) => ({ saleItemId: item.id, productId: o.productId, lotId: o.lotId, locationId, quantity: o.quantity, unitCost: o.unitCost })),
+            });
+          }
         }
         if (pay.confirmed.length) await tx.salePayment.createMany({ data: pay.confirmed.map((p) => ({ saleId, ...p })) });
         for (const [method, amount] of pay.kept) {
@@ -378,11 +512,13 @@ export class SalesService {
               discounts: priced.lineDiscountTotal + priced.ticketDiscountAmount,
               payments: pay.confirmed.map((p) => ({ method: p.method, amount: p.amount, reference: p.reference })),
               change: pay.change,
+              ...(dto.reference ? { reference: dto.reference } : {}),
             },
             reason: priced.ticketDiscountReason,
           },
           tx,
         );
+        if (dto.inTransaction) await dto.inTransaction(tx, saleId);
         return this.createPrintJob(tx, me, { id: saleId, establishmentId: est.id, registerId: s.registerId }, s.register, 'TICKET', false);
       });
     } catch (e) {
@@ -458,6 +594,8 @@ export class SalesService {
       this.prisma.cashRegister.findUniqueOrThrow({ where: { id: sale.registerId } }),
       this.prisma.user.findUnique({ where: { id: sale.cashierId }, select: { fullName: true } }),
     ]);
+    let reference: string | null = null;
+    for (const resolve of this.ticketReferences) reference ??= await resolve(sale.id);
     return {
       paperWidth: register.paperWidth,
       data: {
@@ -465,6 +603,7 @@ export class SalesService {
         establishment: est,
         register,
         number: sale.number,
+        reference,
         createdAt: sale.createdAt,
         cashier: cashier?.fullName ?? null,
         status: sale.status,
@@ -685,6 +824,7 @@ export class SalesService {
         });
       }
       await tx.sale.update({ where: { id }, data: { status: 'CANCELLED', cancelledAt: new Date(), cancelledById: me.userId, cancelReason: dto.reason } });
+      for (const hook of this.cancelHooks) await hook(tx, me, sale);
       await this.audit.record(
         { action: 'SALE_CANCELLED', entityType: 'Sale', entityId: id, establishmentId: sale.establishmentId, oldValues: { status: sale.status }, newValues: { status: 'CANCELLED', number: sale.number, returnNumber: ret.number, total: sale.total }, reason: dto.reason },
         tx,

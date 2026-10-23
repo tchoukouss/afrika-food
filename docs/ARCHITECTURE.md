@@ -252,3 +252,60 @@ envoi et traçabilité réutilisés tels quels.
 | Traçabilité amont d'une vente | stock.view | Responsable, Magasinier, Resp. achats, production |
 
 (Admin et Directeur détiennent toutes ces permissions au niveau groupe.)
+
+## Module 6 — Restaurant & commandes
+
+Décisions R1 à R30 validées le 22/10/2026 (toutes selon la recommandation) :
+
+| # | Sujet | Règle |
+|---|---|---|
+| R1 | Établissements | Module réservé aux établissements dont le type comprend « restaurant » (contrôle serveur). |
+| R2–R4 | Modes | Sur place, comptoir, à emporter, téléphone, en ligne (saisie manuelle), livraison (adresse et téléphone) ; suivi des livraisons et frais au module 7. |
+| R5–R6 | Carte | Carte par établissement : préparé à la commande (recette active obligatoire) ou depuis le stock, poste cuisine / bar, suppléments (produits payants rattachés), options sans prix. Catalogue inchangé. |
+| R7 | Prix | Figé à la saisie (prix local, sinon de base) ; jamais modifiable. |
+| R8 | Tables | Libre, réservée, attente de commande, occupée, attente d'addition, nettoyage (+ hors service) : calculés depuis commandes et réservations ; nettoyage posé après paiement complet. |
+| R9 | Réservations | Table « réservée » de 60 min avant à 30 min après l'heure ; arrivée en ouvrant la commande ; non-venue manuelle ; pas d'acompte. |
+| R10 | Une commande par table | Index unique partiel. |
+| R11–R12 | Stock | Sortie à l'envoi en cuisine / au bar par le moteur du module 3 (mouvements ORDER_CONSUMPTION) ; envoi refusé en entier si un ingrédient manque. |
+| R13 | Statuts | Brouillon (retiré = conservé), puis nouvelle → en préparation → prête → servie, ou annulée ; par ligne, actions groupées par bon ; jamais en arrière. |
+| R14 | Annulation après envoi | Droit « retirer un article envoyé » et motif ; avant préparation : retour aux mêmes lots (ORDER_RETURN) ; après : perte déclarée avec cause. |
+| R15–R16 | Transfert, regroupement | Commande vers une table libre ; lignes non facturées d'une commande à une autre ; regroupement d'une commande sans addition (statut « regroupée »). |
+| R17–R19 | Additions | Séparation par articles (un ticket par addition) ; plusieurs paiements sur un ticket (partage en parts égales) ; addition payée en entier ; remises avec droit et motif ; acomptes et crédit au module 7. |
+| R20–R21 | Encaissement | Par une session de caisse ouverte (caissier, responsable) ; possible à tout moment (paiement d'avance à emporter). |
+| R22–R23 | Cuisine, impression | Écran rafraîchi toutes les 5 s ; bons par poste sur imprimante réseau facultative ; note provisoire « pas un ticket de caisse », réimpressions tracées. |
+| R24 | Concurrence | Verrou de la commande pour toute modification, opérations par lignes (pas de quantité écrasée), anti double envoi sur création, ajout, envoi, annulation, addition, réservation et encaissement, verrouillage trié des soldes. |
+| R25–R27 | Liaison caisse | L'addition devient un ticket du module 5 (même circuit : session, paiements, remises, TVA, mouvements de caisse, impression, audit) sans nouvelle sortie de stock ; ticket portant « Commande … — Table … » ; ticket annulé → addition annulée et commande rouverte, stock inchangé ; remboursement sans effet sur la commande. |
+| R28 | Traçabilité | Commande → lots consommés → production → matières premières et fournisseurs ; lot → produits finis → commandes → tickets. |
+
+Flux d'un envoi (une transaction) : verrou de la commande, besoins calculés
+(recette du module 4 avec rendement, perte prévue et conversion d'unités ;
+produit fini ; composants d'une formule), gel d'inventaire vérifié, soldes
+verrouillés en une requête triée, sorties FEFO, lots consommés enregistrés,
+un bon numéroté par poste, audit ; impression réseau après validation.
+
+Protection en base : un article envoyé ne se modifie plus (trigger), un
+article retiré ou annulé est définitif, les additions ne changent que sur
+leurs colonnes d'état, consommations, annulations, bons et contenus
+d'additions en ajout seul, rien ne se supprime.
+
+Modifications des modules précédents (autorisées par R12 et R25–R27) :
+- module 3 : valeurs ORDER_CONSUMPTION et ORDER_RETURN des mouvements, et leurs libellés ;
+- module 5 : encaissement interne de lignes au prix figé et déjà sorties du stock
+  (`createPresetSale`), mention de commande sur le ticket (`registerTicketReference`),
+  notification d'annulation d'un ticket (`registerCancelHook`), service exporté.
+  La caisse garde exactement son comportement (19 tests inchangés).
+
+### Droits du module 6 par rôle
+
+| Action | Permission | Rôles par défaut |
+|---|---|---|
+| Plan de salle, ouvrir et compléter une commande, envoyer, retirer un brouillon, transférer, regrouper, addition, réservations, nettoyage → libre | restaurant.orders | Serveur, Caissier, Responsable |
+| Annuler un article envoyé (et une commande dont des articles ont été annulés) | restaurant.orders_edit | Responsable |
+| Écran cuisine, faire avancer les statuts, réimprimer un bon | restaurant.kitchen | Chef de cuisine, Responsable |
+| Marquer « servi » | restaurant.kitchen ou restaurant.orders | Chef, Serveur, Caissier, Responsable |
+| Zones, tables, postes, carte, options, hors service | restaurant.tables | Responsable |
+| Remise à l'encaissement | sales.discount | Responsable |
+| Encaisser une addition | sales.create + session de caisse ouverte | Caissier, Responsable |
+| Traçabilité amont d'une commande | stock.view | Responsable, Magasinier, Resp. achats, production |
+
+(Admin et Directeur détiennent toutes ces permissions au niveau groupe.)
