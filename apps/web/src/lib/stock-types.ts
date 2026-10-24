@@ -78,6 +78,7 @@ export const MOVEMENT_TYPES: Record<string, string> = {
   SALE_RETURN: 'Retour client',
   ORDER_CONSUMPTION: 'Sortie cuisine',
   ORDER_RETURN: 'Retour cuisine',
+  CUSTOMER_DELIVERY: 'Livraison commande client',
 };
 
 export interface Movement {

@@ -40,6 +40,8 @@ export const CASH_MOVEMENT_TYPES: Record<string, string> = {
   REFUND: 'Remboursement',
   MANUAL_IN: 'Entrée manuelle',
   MANUAL_OUT: 'Sortie manuelle',
+  CUSTOMER_PAYMENT: 'Paiement client',
+  CUSTOMER_REFUND: 'Remboursement client',
 };
 
 export interface CashMovement {

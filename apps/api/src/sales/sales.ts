@@ -484,9 +484,16 @@ export class SalesService {
             costTotal,
           },
         });
+        // Catégorie du produit figée sur la ligne (historique des ventes, module 8), additions du restaurant comprises.
+        const categories = await tx.product.findMany({
+          where: { id: { in: [...new Set(priced.lines.map((l) => l.productId))] } },
+          select: { id: true, categoryId: true, category: { select: { name: true } } },
+        });
         for (const [position, { line, lots, cost }] of issued.entries()) {
           const { parts: _parts, presetCost: _cost, ...data } = line;
-          const item = await tx.saleItem.create({ data: { ...data, saleId, position, costTotal: cost } });
+          const c = categories.find((x) => x.id === line.productId);
+          const category = { categoryId: c?.category ? c.categoryId : null, categoryName: c?.category?.name ?? null };
+          const item = await tx.saleItem.create({ data: { ...data, ...category, saleId, position, costTotal: cost } });
           if (lots.length) {
             await tx.saleItemLot.createMany({
               data: lots.map((o) => ({ saleItemId: item.id, productId: o.productId, lotId: o.lotId, locationId, quantity: o.quantity, unitCost: o.unitCost })),

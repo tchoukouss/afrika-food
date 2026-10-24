@@ -626,6 +626,7 @@ enum StockMovementType {
   SALE_RETURN // retour en stock (annulation / remboursement d'une vente) — module 5
   ORDER_CONSUMPTION // sortie à l'envoi en cuisine / au bar d'une commande restaurant — module 6
   ORDER_RETURN // retour en stock d'un article annulé avant préparation — module 6
+  CUSTOMER_DELIVERY // remise ou livraison d'une commande client — module 7
 }
 
 // Journal des mouvements : en ajout seul (trigger). quantity signée :
@@ -1587,6 +1588,8 @@ enum CashMovementType {
   REFUND // remboursement (négatif)
   MANUAL_IN // entrée manuelle autorisée
   MANUAL_OUT // sortie manuelle autorisée (négatif)
+  CUSTOMER_PAYMENT // paiement ou acompte d'un client du module 7 (jamais une vente)
+  CUSTOMER_REFUND // remboursement d'un client du module 7, ou correction d'un paiement (négatif)
 }
 
 // Mouvement de caisse : en ajout seul. amount signé (entrée > 0, sortie < 0).
@@ -1685,6 +1688,9 @@ model SaleItem {
   // Copie au moment de la vente (le catalogue peut évoluer).
   productCode      String  @map("product_code")
   productName      String  @map("product_name")
+  // Catégorie du produit figée à la création de la ligne (historique des ventes, module 8).
+  categoryId       String?  @map("category_id") @db.Uuid
+  categoryName     String?  @map("category_name")
   isMenu           Boolean @default(false) @map("is_menu")
   quantity         Decimal @db.Decimal(18, 4)
   unitPrice        BigInt  @map("unit_price")
@@ -2238,4 +2244,693 @@ model RestaurantPrintJob {
   @@index([kitchenTicketId])
   @@index([billId])
   @@map("restaurant_print_jobs")
+}
+
+// ===========================================================================
+// Module 7 — Clients & facturation (étape 1 : clients, encours, crédit).
+//
+// Clients au niveau du groupe (décision D9) ; aucune relation Prisma vers les
+// modèles des modules précédents : clés étrangères en SQL dans la migration.
+// Montants en FCFA (BigInt). Rien n'est supprimé (désactivation tracée).
+// ===========================================================================
+
+enum CustomerType {
+  INDIVIDUAL // particulier
+  BUSINESS // entreprise
+  WHOLESALER // grossiste
+  EVENT // client événementiel
+}
+
+model Customer {
+  id              String       @id @default(uuid()) @db.Uuid
+  companyId       String       @map("company_id") @db.Uuid
+  clientRequestId String?      @map("client_request_id") @db.Uuid
+  type            CustomerType
+  name            String
+  phone           String?
+  // Téléphone ramené à ses chiffres (indicatif +225 retiré) : unique dans l'entreprise.
+  phoneNormalized String?      @map("phone_normalized")
+  email           String?
+  address         String?
+  taxId           String?      @map("tax_id")
+  // Limite de crédit en FCFA ; vide = aucun crédit sans autorisation.
+  creditLimit     BigInt?      @map("credit_limit")
+  paymentTermDays Int          @default(0) @map("payment_term_days")
+  notes           String?
+  isActive        Boolean      @default(true) @map("is_active")
+  createdById     String       @map("created_by_id") @db.Uuid
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  creditOverrides CreditOverride[]
+  quotes          Quote[]
+  orders          CustomerOrder[]
+  payments        CustomerPayment[]
+  deposits        Deposit[]
+  invoices        Invoice[]
+
+  @@unique([companyId, clientRequestId])
+  @@index([companyId, name])
+  @@map("customers")
+}
+
+// Pré-autorisation de dépassement de crédit (décision D4) : donnée par un
+// responsable (« Autoriser un dépassement de crédit ») pour un client, un
+// établissement et un montant maximal, valable 1 heure, consommée une seule fois.
+model CreditOverride {
+  id              String    @id @default(uuid()) @db.Uuid
+  companyId       String    @map("company_id") @db.Uuid
+  establishmentId String    @map("establishment_id") @db.Uuid
+  customerId      String    @map("customer_id") @db.Uuid
+  clientRequestId String?   @map("client_request_id") @db.Uuid
+  maxAmount       BigInt    @map("max_amount")
+  reason          String
+  approvedById    String    @map("approved_by_id") @db.Uuid
+  expiresAt       DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt          DateTime? @map("used_at") @db.Timestamptz(3)
+  usedById        String?   @map("used_by_id") @db.Uuid
+  usedAmount      BigInt?   @map("used_amount")
+  // Document qui a consommé l'autorisation (ticket, facture… étapes suivantes).
+  usedReference   String?   @map("used_reference")
+  cancelledAt     DateTime? @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById   String?   @map("cancelled_by_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@unique([companyId, clientRequestId])
+  @@index([customerId, expiresAt])
+  @@map("credit_overrides")
+}
+
+// ---------------------------------------------------------------------------
+// Module 7, étape 2 : devis, commandes clients et événements.
+// Prix TTC figés à la création ; une ligne est un produit du catalogue ou des
+// frais propres au module 7 (sans stock, décision D8).
+// ---------------------------------------------------------------------------
+
+enum CustomerDocumentKind {
+  STANDARD
+  EVENT // événement (décision D10) : même circuit, détails en 1 pour 1
+}
+
+enum DocumentLineKind {
+  PRODUCT
+  FEE // frais (livraison, service…) : aucun stock
+}
+
+enum QuoteStatus {
+  DRAFT
+  SENT
+  ACCEPTED // crée une commande, une seule
+  REFUSED
+}
+
+model Quote {
+  id               String               @id @default(uuid()) @db.Uuid
+  companyId        String               @map("company_id") @db.Uuid
+  establishmentId  String               @map("establishment_id") @db.Uuid
+  customerId       String               @map("customer_id") @db.Uuid
+  number           String
+  clientRequestId  String?              @map("client_request_id") @db.Uuid
+  kind             CustomerDocumentKind @default(STANDARD)
+  status           QuoteStatus          @default(DRAFT)
+  // « Expiré » est calculé : envoyé et date de validité dépassée.
+  validUntil       DateTime             @map("valid_until") @db.Date
+  desiredAt        DateTime?            @map("desired_at") @db.Timestamptz(3)
+  // Détails d'événement, recopiés dans la commande à l'acceptation.
+  event            Json?
+  notes            String?
+  total            BigInt
+  taxTotal         BigInt               @map("tax_total")
+  createdById      String               @map("created_by_id") @db.Uuid
+  sentAt           DateTime?            @map("sent_at") @db.Timestamptz(3)
+  sentById         String?              @map("sent_by_id") @db.Uuid
+  acceptedAt       DateTime?            @map("accepted_at") @db.Timestamptz(3)
+  acceptedById     String?              @map("accepted_by_id") @db.Uuid
+  refusedAt        DateTime?            @map("refused_at") @db.Timestamptz(3)
+  refusedById      String?              @map("refused_by_id") @db.Uuid
+  refuseReason     String?              @map("refuse_reason")
+  createdAt        DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  customer Customer             @relation(fields: [customerId], references: [id])
+  lines    QuoteLine[]
+  history  QuoteStatusHistory[]
+  order    CustomerOrder?
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@index([customerId])
+  @@map("quotes")
+}
+
+model QuoteLine {
+  id          String           @id @default(uuid()) @db.Uuid
+  quoteId     String           @map("quote_id") @db.Uuid
+  position    Int
+  kind        DocumentLineKind
+  productId   String?          @map("product_id") @db.Uuid
+  productCode String?          @map("product_code")
+  label       String
+  quantity    Decimal          @db.Decimal(18, 4)
+  unitPrice   BigInt           @map("unit_price")
+  taxRate     Decimal          @map("tax_rate") @db.Decimal(5, 2)
+  lineTotal   BigInt           @map("line_total")
+  taxAmount   BigInt           @map("tax_amount")
+  note        String?
+  // Produit fabriqué pour la commande (ordre de production du module 4) au lieu d'être pris en stock.
+  madeToOrder Boolean          @default(false) @map("made_to_order")
+
+  quote Quote @relation(fields: [quoteId], references: [id])
+
+  @@unique([quoteId, position])
+  @@map("quote_lines")
+}
+
+model QuoteStatusHistory {
+  id         String       @id @default(uuid()) @db.Uuid
+  quoteId    String       @map("quote_id") @db.Uuid
+  fromStatus QuoteStatus? @map("from_status")
+  toStatus   QuoteStatus  @map("to_status")
+  reason     String?
+  userId     String       @map("user_id") @db.Uuid
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  quote Quote @relation(fields: [quoteId], references: [id])
+
+  @@index([quoteId])
+  @@map("quote_status_history")
+}
+
+enum CustomerOrderStatus {
+  DRAFT
+  CONFIRMED
+  IN_PREPARATION
+  READY
+  DELIVERED
+  COMPLETED
+  CANCELLED // possible avant « livrée », avec motif
+}
+
+model CustomerOrder {
+  id              String               @id @default(uuid()) @db.Uuid
+  companyId       String               @map("company_id") @db.Uuid
+  establishmentId String               @map("establishment_id") @db.Uuid
+  customerId      String               @map("customer_id") @db.Uuid
+  number          String
+  clientRequestId String?              @map("client_request_id") @db.Uuid
+  kind            CustomerDocumentKind @default(STANDARD)
+  status          CustomerOrderStatus  @default(DRAFT)
+  // Devis d'origine : un devis accepté ne crée qu'une commande.
+  quoteId         String?              @unique @map("quote_id") @db.Uuid
+  dueAt           DateTime?            @map("due_at") @db.Timestamptz(3)
+  notes           String?
+  total           BigInt
+  taxTotal        BigInt               @map("tax_total")
+  createdById     String               @map("created_by_id") @db.Uuid
+  confirmedAt     DateTime?            @map("confirmed_at") @db.Timestamptz(3)
+  cancelledAt     DateTime?            @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById   String?              @map("cancelled_by_id") @db.Uuid
+  cancelReason    String?              @map("cancel_reason")
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  customer Customer                     @relation(fields: [customerId], references: [id])
+  quote    Quote?                       @relation(fields: [quoteId], references: [id])
+  lines      CustomerOrderLine[]
+  event      CustomerOrderEvent?
+  history    CustomerOrderStatusHistory[]
+  deliveries Delivery[]
+  deposits   Deposit[]
+  invoices   Invoice[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@index([customerId])
+  @@map("customer_orders")
+}
+
+model CustomerOrderLine {
+  id                String           @id @default(uuid()) @db.Uuid
+  orderId           String           @map("order_id") @db.Uuid
+  position          Int
+  kind              DocumentLineKind
+  productId         String?          @map("product_id") @db.Uuid
+  productCode       String?          @map("product_code")
+  // Catégorie du produit figée à la création de la ligne (historique des ventes, module 8).
+  categoryId        String?          @map("category_id") @db.Uuid
+  categoryName      String?          @map("category_name")
+  label             String
+  quantity          Decimal          @db.Decimal(18, 4)
+  unitPrice         BigInt           @map("unit_price")
+  taxRate           Decimal          @map("tax_rate") @db.Decimal(5, 2)
+  lineTotal         BigInt           @map("line_total")
+  taxAmount         BigInt           @map("tax_amount")
+  note              String?
+  // Fabriqué pour la commande : pas de réservation à la confirmation, ordre de production lié, lot fini réservé à la fin de production.
+  madeToOrder       Boolean          @default(false) @map("made_to_order")
+  productionOrderId String?          @map("production_order_id") @db.Uuid
+  // Quantité sortie du stock à la remise ou à la livraison (une seule sortie).
+  deliveredQuantity Decimal          @default(0) @map("delivered_quantity") @db.Decimal(18, 4)
+
+  order        CustomerOrder           @relation(fields: [orderId], references: [id])
+  reservations OrderReservation[]
+  issues       CustomerOrderLineIssue[]
+
+  @@unique([orderId, position])
+  @@map("customer_order_lines")
+}
+
+enum EventType {
+  WEDDING // mariage
+  BAPTISM // baptême
+  BIRTHDAY // anniversaire
+  FUNERAL // funérailles
+  SEMINAR // séminaire
+  CORPORATE_MEAL // repas d'entreprise
+  BUFFET
+  COCKTAIL
+  OTHER
+}
+
+model CustomerOrderEvent {
+  orderId      String    @id @map("order_id") @db.Uuid
+  eventType    EventType @map("event_type")
+  eventDate    DateTime  @map("event_date") @db.Timestamptz(3)
+  venue        String?
+  guests       Int?
+  contactName  String?   @map("contact_name")
+  contactPhone String?   @map("contact_phone")
+  notes        String?
+
+  order CustomerOrder @relation(fields: [orderId], references: [id])
+
+  @@map("customer_order_events")
+}
+
+model CustomerOrderStatusHistory {
+  id         String               @id @default(uuid()) @db.Uuid
+  orderId    String               @map("order_id") @db.Uuid
+  fromStatus CustomerOrderStatus? @map("from_status")
+  toStatus   CustomerOrderStatus  @map("to_status")
+  reason     String?
+  userId     String               @map("user_id") @db.Uuid
+  createdAt  DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  order CustomerOrder @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("customer_order_status_history")
+}
+
+// Réservation de stock pour une ligne de commande : préparée ici, utilisée
+// par le moteur de stock à l'étape 3 (décision D5).
+model OrderReservation {
+  id          String    @id @default(uuid()) @db.Uuid
+  orderLineId String    @map("order_line_id") @db.Uuid
+  balanceId   String    @map("balance_id") @db.Uuid
+  lotId       String    @map("lot_id") @db.Uuid
+  quantity    Decimal   @db.Decimal(18, 4)
+  releasedAt  DateTime? @map("released_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  line CustomerOrderLine @relation(fields: [orderLineId], references: [id])
+
+  @@index([orderLineId])
+  @@map("order_reservations")
+}
+
+// ---------------------------------------------------------------------------
+// Module 7, étape 3 : sorties de stock et livraisons des commandes clients.
+// ---------------------------------------------------------------------------
+
+// Lots sortis du stock à la remise ou à la livraison (mouvement CUSTOMER_DELIVERY).
+model CustomerOrderLineIssue {
+  id          String    @id @default(uuid()) @db.Uuid
+  lineId      String    @map("line_id") @db.Uuid
+  deliveryId  String?   @map("delivery_id") @db.Uuid
+  productId   String    @map("product_id") @db.Uuid
+  lotId       String    @map("lot_id") @db.Uuid
+  locationId  String    @map("location_id") @db.Uuid
+  quantity    Decimal   @db.Decimal(18, 4)
+  unitCost    Decimal   @map("unit_cost") @db.Decimal(18, 4)
+  value       Decimal   @db.Decimal(18, 2)
+  createdById String    @map("created_by_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  line     CustomerOrderLine @relation(fields: [lineId], references: [id])
+  delivery Delivery?         @relation(fields: [deliveryId], references: [id])
+
+  @@index([lineId])
+  @@index([lotId])
+  @@map("customer_order_line_issues")
+}
+
+enum DeliveryStatus {
+  TO_PREPARE // à préparer
+  READY // prête
+  OUT // en livraison
+  DELIVERED // livrée : sortie de stock unique
+  FAILED // échouée (motif) : la commande reste à livrer
+  CANCELLED
+}
+
+model Delivery {
+  id              String         @id @default(uuid()) @db.Uuid
+  companyId       String         @map("company_id") @db.Uuid
+  establishmentId String         @map("establishment_id") @db.Uuid
+  orderId         String         @map("order_id") @db.Uuid
+  number          String
+  clientRequestId String?        @map("client_request_id") @db.Uuid
+  status          DeliveryStatus @default(TO_PREPARE)
+  // Livreur : un utilisateur de l'établissement.
+  driverId        String?        @map("driver_id") @db.Uuid
+  address         String
+  phone           String?
+  scheduledAt     DateTime?      @map("scheduled_at") @db.Timestamptz(3)
+  // Frais de livraison (frais du module 7, facturés à l'étape factures ; jamais de stock).
+  fee             BigInt         @default(0)
+  feeLabel        String?        @map("fee_label")
+  notes           String?
+  failedReason    String?        @map("failed_reason")
+  cancelReason    String?        @map("cancel_reason")
+  deliveredAt     DateTime?      @map("delivered_at") @db.Timestamptz(3)
+  createdById     String         @map("created_by_id") @db.Uuid
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  order   CustomerOrder           @relation(fields: [orderId], references: [id])
+  history DeliveryStatusHistory[]
+  issues  CustomerOrderLineIssue[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([establishmentId, status])
+  @@index([driverId, status])
+  @@map("deliveries")
+}
+
+model DeliveryStatusHistory {
+  id         String          @id @default(uuid()) @db.Uuid
+  deliveryId String          @map("delivery_id") @db.Uuid
+  fromStatus DeliveryStatus? @map("from_status")
+  toStatus   DeliveryStatus  @map("to_status")
+  reason     String?
+  userId     String          @map("user_id") @db.Uuid
+  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  delivery Delivery @relation(fields: [deliveryId], references: [id])
+
+  @@index([deliveryId])
+  @@map("delivery_status_history")
+}
+
+// --- Module 7, étape 4 : paiements clients, répartitions, acomptes ---------------------
+
+enum CustomerPaymentStatus {
+  RECORDED
+  CANCELLED // correction d'une erreur : mouvement inverse si la session de caisse est encore ouverte
+}
+
+// Paiement reçu d'un client (décision D1 c) : jamais une vente ni du chiffre
+// d'affaires. Espèces, mobile money, carte et « autre » passent par la session
+// de caisse ouverte de celui qui encaisse (mouvement CUSTOMER_PAYMENT du
+// module 5) ; virement et chèque sont enregistrés hors caisse. La partie non
+// répartie reste une avance du client.
+model CustomerPayment {
+  id                 String                @id @default(uuid()) @db.Uuid
+  companyId          String                @map("company_id") @db.Uuid
+  establishmentId    String                @map("establishment_id") @db.Uuid
+  customerId         String                @map("customer_id") @db.Uuid
+  number             String
+  clientRequestId    String?               @map("client_request_id") @db.Uuid
+  status             CustomerPaymentStatus @default(RECORDED)
+  method             PaymentMethod
+  amount             BigInt
+  reference          String?
+  provider           String
+  sessionId          String?               @map("session_id") @db.Uuid
+  cashMovementId     String?               @unique @map("cash_movement_id") @db.Uuid
+  reversalMovementId String?               @unique @map("reversal_movement_id") @db.Uuid
+  notes              String?
+  createdById        String                @map("created_by_id") @db.Uuid
+  createdAt          DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  cancelledAt        DateTime?             @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById      String?               @map("cancelled_by_id") @db.Uuid
+  cancelReason       String?               @map("cancel_reason")
+
+  customer    Customer            @relation(fields: [customerId], references: [id])
+  allocations PaymentAllocation[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([customerId])
+  @@index([establishmentId, createdAt])
+  @@map("customer_payments")
+}
+
+// Cible d'une répartition : un acompte, ou une facture (étape 5).
+enum AllocationTarget {
+  DEPOSIT
+  INVOICE
+}
+
+// Répartition d'un paiement : jamais au-delà du paiement (contrôle sous verrou
+// et trigger) ; libérée, jamais supprimée.
+model PaymentAllocation {
+  id            String           @id @default(uuid()) @db.Uuid
+  paymentId     String           @map("payment_id") @db.Uuid
+  target        AllocationTarget
+  // Acompte financé ; pour une facture, acompte d'où vient l'argent imputé.
+  depositId     String?          @map("deposit_id") @db.Uuid
+  invoiceId     String?          @map("invoice_id") @db.Uuid
+  amount        BigInt
+  createdById   String           @map("created_by_id") @db.Uuid
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  releasedAt    DateTime?        @map("released_at") @db.Timestamptz(3)
+  releasedById  String?          @map("released_by_id") @db.Uuid
+  releaseReason String?          @map("release_reason")
+
+  payment CustomerPayment @relation(fields: [paymentId], references: [id])
+  deposit Deposit?        @relation(fields: [depositId], references: [id])
+  invoice Invoice?        @relation(fields: [invoiceId], references: [id])
+
+  @@index([paymentId])
+  @@index([depositId])
+  @@index([invoiceId])
+  @@map("payment_allocations")
+}
+
+enum DepositStatus {
+  RECEIVED // avance rattachée à la commande
+  CUSTOMER_CREDIT // avance conservée en crédit du client (commande annulée, par exemple)
+  REFUNDED // entièrement remboursée
+  CANCELLED // saisie erronée : répartitions libérées
+}
+
+// Acompte (décision D6) : avance du client, hors chiffre d'affaires, reçu ACP.
+// TVA éventuelle : À CONFIRMER AVEC LE COMPTABLE (aucune règle codée).
+model Deposit {
+  id              String        @id @default(uuid()) @db.Uuid
+  companyId       String        @map("company_id") @db.Uuid
+  establishmentId String        @map("establishment_id") @db.Uuid
+  customerId      String        @map("customer_id") @db.Uuid
+  orderId         String?       @map("order_id") @db.Uuid
+  number          String
+  clientRequestId String?       @map("client_request_id") @db.Uuid
+  status          DepositStatus @default(RECEIVED)
+  amount          BigInt
+  refundedAmount  BigInt        @default(0) @map("refunded_amount")
+  notes           String?
+  createdById     String        @map("created_by_id") @db.Uuid
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  creditedAt      DateTime?     @map("credited_at") @db.Timestamptz(3)
+  creditReason    String?       @map("credit_reason")
+  cancelledAt     DateTime?     @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById   String?       @map("cancelled_by_id") @db.Uuid
+  cancelReason    String?       @map("cancel_reason")
+
+  customer    Customer            @relation(fields: [customerId], references: [id])
+  order       CustomerOrder?      @relation(fields: [orderId], references: [id])
+  allocations PaymentAllocation[]
+  refunds     CustomerRefund[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([customerId])
+  @@index([orderId])
+  @@map("deposits")
+}
+
+// Remboursement d'un acompte ou d'un avoir : par la caisse (mouvement
+// CUSTOMER_REFUND du module 5) ou hors caisse (virement, chèque). En ajout seul.
+model CustomerRefund {
+  id              String        @id @default(uuid()) @db.Uuid
+  companyId       String        @map("company_id") @db.Uuid
+  establishmentId String        @map("establishment_id") @db.Uuid
+  customerId      String        @map("customer_id") @db.Uuid
+  depositId       String?       @map("deposit_id") @db.Uuid
+  creditNoteId    String?       @map("credit_note_id") @db.Uuid
+  clientRequestId String?       @map("client_request_id") @db.Uuid
+  method          PaymentMethod
+  amount          BigInt
+  reference       String?
+  provider        String
+  sessionId       String?       @map("session_id") @db.Uuid
+  cashMovementId  String?       @unique @map("cash_movement_id") @db.Uuid
+  reason          String
+  createdById     String        @map("created_by_id") @db.Uuid
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  deposit    Deposit?    @relation(fields: [depositId], references: [id])
+  creditNote CreditNote? @relation(fields: [creditNoteId], references: [id])
+
+  @@unique([companyId, clientRequestId])
+  @@index([depositId])
+  @@index([creditNoteId])
+  @@map("customer_refunds")
+}
+
+// --- Module 7, étape 5 : factures, avoirs et créances ----------------------------------
+
+enum InvoiceSource {
+  ORDER // commande client du module 7
+  SALE // ticket du module 5 : jamais une seconde vente ni un second chiffre d'affaires
+  MANUAL // prestations du module 7 (lignes « frais », sans stock)
+}
+
+// États enregistrés seulement (décision D7) : « payée », « partiellement
+// payée » et « échue » se calculent à la lecture.
+enum InvoiceStatus {
+  DRAFT // sans numéro
+  ISSUED // numéro FAC, figée
+  DISPUTED // en litige
+  CANCELLED // brouillon abandonné, ou facture annulée par un avoir total
+}
+
+model Invoice {
+  id              String        @id @default(uuid()) @db.Uuid
+  companyId       String        @map("company_id") @db.Uuid
+  establishmentId String        @map("establishment_id") @db.Uuid
+  customerId      String        @map("customer_id") @db.Uuid
+  // Numéro FAC attribué à l'émission, dans la transaction (décision D2).
+  number          String?
+  clientRequestId String?       @map("client_request_id") @db.Uuid
+  source          InvoiceSource
+  orderId         String?       @map("order_id") @db.Uuid
+  saleId          String?       @map("sale_id") @db.Uuid
+  status          InvoiceStatus @default(DRAFT)
+  total           BigInt
+  taxTotal        BigInt        @map("tax_total")
+  // Montant déjà réglé à la caisse du module 5 (facture d'un ticket).
+  posPaidAmount   BigInt        @default(0) @map("pos_paid_amount")
+  // Conditions de paiement du client figées à l'émission.
+  paymentTermDays Int?          @map("payment_term_days")
+  issuedAt        DateTime?     @map("issued_at") @db.Timestamptz(3)
+  issuedById      String?       @map("issued_by_id") @db.Uuid
+  dueDate         DateTime?     @map("due_date") @db.Date
+  notes           String?
+  disputedAt      DateTime?     @map("disputed_at") @db.Timestamptz(3)
+  disputeReason   String?       @map("dispute_reason")
+  cancelledAt     DateTime?     @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById   String?       @map("cancelled_by_id") @db.Uuid
+  cancelReason    String?       @map("cancel_reason")
+  createdById     String        @map("created_by_id") @db.Uuid
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  customer    Customer            @relation(fields: [customerId], references: [id])
+  order       CustomerOrder?      @relation(fields: [orderId], references: [id])
+  lines       InvoiceLine[]
+  creditNotes CreditNote[]
+  allocations PaymentAllocation[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([customerId])
+  @@index([establishmentId, status])
+  @@index([orderId])
+  @@index([saleId])
+  @@map("invoices")
+}
+
+// Ligne de facture : copie figée (prix TTC, TVA) de la commande, du ticket ou des frais saisis.
+model InvoiceLine {
+  id          String           @id @default(uuid()) @db.Uuid
+  invoiceId   String           @map("invoice_id") @db.Uuid
+  position    Int
+  kind        DocumentLineKind
+  productId   String?          @map("product_id") @db.Uuid
+  productCode String?          @map("product_code")
+  // Catégorie copiée de la ligne d'origine (commande ou ticket), jamais relue du catalogue.
+  categoryId   String?         @map("category_id") @db.Uuid
+  categoryName String?         @map("category_name")
+  label       String
+  quantity    Decimal          @db.Decimal(18, 4)
+  unitPrice   BigInt           @map("unit_price")
+  taxRate     Decimal          @map("tax_rate") @db.Decimal(5, 2)
+  lineTotal   BigInt           @map("line_total")
+  taxAmount   BigInt           @map("tax_amount")
+  note        String?
+  orderLineId String?          @map("order_line_id") @db.Uuid
+  saleItemId  String?          @map("sale_item_id") @db.Uuid
+  deliveryId  String?          @map("delivery_id") @db.Uuid
+
+  invoice     Invoice          @relation(fields: [invoiceId], references: [id])
+  creditLines CreditNoteLine[]
+
+  @@index([invoiceId])
+  @@map("invoice_lines")
+}
+
+// Avoir (décision D3) : numéro AVR à l'émission, toujours lié à sa facture,
+// jamais au-delà du montant encore corrigeable. Répartition figée de son
+// règlement : réduction du reste dû, crédit client, remboursement. En ajout seul.
+model CreditNote {
+  id              String   @id @default(uuid()) @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  establishmentId String   @map("establishment_id") @db.Uuid
+  customerId      String   @map("customer_id") @db.Uuid
+  invoiceId       String   @map("invoice_id") @db.Uuid
+  number          String
+  clientRequestId String?  @map("client_request_id") @db.Uuid
+  total           BigInt
+  taxTotal        BigInt   @map("tax_total")
+  reason          String
+  reducedDue      BigInt   @map("reduced_due")
+  customerCredit  BigInt   @map("customer_credit")
+  refundAmount    BigInt   @map("refund_amount")
+  createdById     String   @map("created_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  invoice Invoice          @relation(fields: [invoiceId], references: [id])
+  lines   CreditNoteLine[]
+  refunds CustomerRefund[]
+
+  @@unique([companyId, number])
+  @@unique([companyId, clientRequestId])
+  @@index([invoiceId])
+  @@map("credit_notes")
+}
+
+model CreditNoteLine {
+  id            String   @id @default(uuid()) @db.Uuid
+  creditNoteId  String   @map("credit_note_id") @db.Uuid
+  invoiceLineId String   @map("invoice_line_id") @db.Uuid
+  label         String
+  quantity      Decimal? @db.Decimal(18, 4)
+  amount        BigInt
+  taxRate       Decimal  @map("tax_rate") @db.Decimal(5, 2)
+  taxAmount     BigInt   @map("tax_amount")
+
+  creditNote  CreditNote  @relation(fields: [creditNoteId], references: [id])
+  invoiceLine InvoiceLine @relation(fields: [invoiceLineId], references: [id])
+
+  @@index([creditNoteId])
+  @@index([invoiceLineId])
+  @@map("credit_note_lines")
 }

@@ -18,7 +18,7 @@ import { Transform, Type } from 'class-transformer';
 import { ArrayMaxSize, IsArray, IsEnum, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
 import { AuditService } from '../audit/audit.service';
 import { AnyEstablishmentScope, AuthUser, CurrentUser, RequirePermissions } from '../auth/decorators';
-import { Db, PrismaService } from '../prisma/prisma.service';
+import { Db, PrismaService, Tx } from '../prisma/prisma.service';
 import { idempotent, userNames } from '../stock/common';
 import { assertCan, emptyToNull, establishmentsWithAny, lockSalesRow, METHOD_LABELS, nextSalesNumber, trim, uniqueViolation } from './common';
 
@@ -68,6 +68,45 @@ export async function expectedByMethod(db: Db, sessionId: string) {
   const map = new Map<PaymentMethod, bigint>();
   rows.forEach((r) => map.set(r.method, r._sum.amount ?? 0n));
   return map;
+}
+
+/**
+ * Mouvement de caisse d'un paiement ou d'un remboursement client (module 7,
+ * décision D1), dans la transaction de l'opération : session ouverte de
+ * l'établissement, verrouillée ; pour un encaissement ou un remboursement,
+ * session de l'utilisateur lui-même. Une sortie d'espèces ne dépasse jamais
+ * les espèces présentes. Le montant apparaît au rapport Z et dans l'attendu
+ * de la clôture, jamais dans les ventes.
+ */
+export async function customerCashMovement(
+  tx: Tx,
+  me: AuthUser,
+  input: { sessionId: string; establishmentId: string; type: 'CUSTOMER_PAYMENT' | 'CUSTOMER_REFUND'; method: PaymentMethod; amount: bigint; reason: string | null; ownSession: boolean },
+) {
+  await lockSalesRow(tx, 'cash_sessions', input.sessionId);
+  const s = await tx.cashSession.findFirst({ where: { id: input.sessionId, companyId: me.companyId } });
+  if (!s || s.establishmentId !== input.establishmentId) throw new BadRequestException('Session de caisse invalide pour cet établissement');
+  if (s.status !== 'OPEN') throw new ConflictException('Session de caisse clôturée');
+  if (input.ownSession) {
+    assertCan(me, s.establishmentId, 'cash.operate');
+    if (s.cashierId !== me.userId) throw new ForbiddenException('Cette session de caisse appartient à un autre caissier');
+  }
+  if (input.type === 'CUSTOMER_REFUND' && input.method === 'CASH') {
+    const cash = (await expectedByMethod(tx, s.id)).get('CASH') ?? 0n;
+    if (input.amount > cash) throw new ConflictException(`Remboursement impossible : il n’y a que ${cash} FCFA en espèces dans la caisse`);
+  }
+  return tx.cashMovement.create({
+    data: {
+      companyId: me.companyId,
+      establishmentId: s.establishmentId,
+      sessionId: s.id,
+      type: input.type,
+      method: input.method,
+      amount: input.type === 'CUSTOMER_REFUND' ? -input.amount : input.amount,
+      reason: input.reason,
+      userId: me.userId,
+    },
+  });
 }
 
 @Injectable()

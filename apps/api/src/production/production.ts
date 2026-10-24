@@ -14,7 +14,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { LossCause, Prisma, ProductionOrder, ProductionStatus } from '@prisma/client';
+import { LossCause, Prisma, ProductionOrder, ProductionStatus, StockLot } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import { ArrayMaxSize, IsArray, IsDateString, IsEnum, IsNumber, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
 import { AuditService } from '../audit/audit.service';
@@ -89,6 +89,26 @@ class ProductionQuery {
   @IsOptional() @IsEnum(ProductionStatus) status?: ProductionStatus;
 }
 
+/** Lot fini que la fin de production vient de créer et de mettre en stock. */
+export interface ProductionCompletion {
+  orderId: string;
+  establishmentId: string;
+  productId: string;
+  lot: StockLot;
+  locationId: string;
+  quantity: Prisma.Decimal;
+}
+
+/**
+ * Appelé dans la transaction de la fin de production, juste après la mise en
+ * stock du lot fini (ex. module 7 : réserver ce lot pour une commande client).
+ * Une erreur annule toute la fin de production.
+ */
+export type ProductionCompletionHook = (tx: Tx, me: AuthUser, completion: ProductionCompletion) => Promise<void>;
+
+// Registre commun à toutes les instances du service (chaque module Nest en crée une).
+const completionHooks: ProductionCompletionHook[] = [];
+
 /** Statuts visibles du magasinier (lecture des besoins à préparer, décision H). */
 const STOREKEEPER_STATUSES: ProductionStatus[] = ['VALIDATED', 'IN_PROGRESS', 'COMPLETED', 'CONTROLLED'];
 
@@ -100,6 +120,15 @@ export class ProductionService {
     private readonly engine: StockEngine,
     private readonly costing: CostingService,
   ) {}
+
+  /** Enregistre un crochet de fin de production ; renvoie la fonction qui le retire. */
+  registerCompletionHook(hook: ProductionCompletionHook): () => void {
+    completionHooks.push(hook);
+    return () => {
+      const i = completionHooks.indexOf(hook);
+      if (i >= 0) completionHooks.splice(i, 1);
+    };
+  }
 
   // --- Visibilité ---------------------------------------------------------------
 
@@ -481,6 +510,9 @@ export class ProductionService {
         });
         await this.engine.addToLot(tx, this.ctx(me, order, order.destLocationId, 'PRODUCTION'), lot, produced);
         await tx.productionOutput.create({ data: { orderId: id, lotId: lot.id, locationId: order.destLocationId, quantity: produced, unitCost: unitCost! } });
+        for (const hook of completionHooks) {
+          await hook(tx, me, { orderId: id, establishmentId: order.establishmentId, productId: order.productId, lot, locationId: order.destLocationId, quantity: produced });
+        }
       }
       if (produced.lt(planned)) {
         const gap = planned.sub(produced);
