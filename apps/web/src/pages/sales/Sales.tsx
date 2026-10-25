@@ -69,7 +69,12 @@ function SalesList({ onOpen }: { onOpen: (id: string) => void }) {
               <Td>{formatDateTime(s.createdAt)}</Td>
               <Td>{s.register?.code}</Td>
               <Td>{s.cashier}</Td>
-              <Td className="text-xs">{[...new Set(s.payments.map((p) => method(p.method)))].join(', ')}</Td>
+              <Td className="text-xs">
+                {n(s.creditAmount) > 0
+                  ? // Vente à crédit : montants encaissés par moyen + part à crédit.
+                    [...s.payments.map((p) => `${method(p.method)} ${formatXOF(p.amount)}`), `Crédit ${formatXOF(s.creditAmount)}`].join(' + ')
+                  : [...new Set(s.payments.map((p) => method(p.method)))].join(', ')}
+              </Td>
               <Td className="whitespace-nowrap font-semibold">
                 {formatXOF(s.total)}
                 {n(s.refundedTotal) > 0 && <div className="text-xs font-normal text-red-700">−{formatXOF(s.refundedTotal)}</div>}
@@ -152,6 +157,25 @@ function SaleDialog({ id, onClose }: { id: string; onClose: () => void }) {
   );
 }
 
+/**
+ * Client et facture d'une vente à crédit, lus dans les factures de son établissement
+ * (la vente ne les porte pas). Rien n'est affiché sans droit de lecture des factures.
+ */
+function CreditInvoice({ sale }: { sale: SaleDetail }) {
+  const { data } = useQuery({
+    queryKey: ['invoices', 'sale', sale.id],
+    queryFn: () => api.get<{ id: string; number: string | null; saleId: string | null; customer: { id: string; name: string } | null }[]>(`/invoices?establishmentId=${sale.establishmentId}`),
+  });
+  const invoice = data?.find((i) => i.saleId === sale.id);
+  if (!invoice) return null;
+  return (
+    <>
+      {invoice.customer && <Row label="Client" value={invoice.customer.name} />}
+      {invoice.number && <Row label="Facture" value={invoice.number} />}
+    </>
+  );
+}
+
 function SaleBody({ sale: s }: { sale: SaleDetail }) {
   return (
     <>
@@ -193,8 +217,10 @@ function SaleBody({ sale: s }: { sale: SaleDetail }) {
           {s.payments.map((p) => (
             <Row key={p.id} label={`${method(p.method)}${p.reference ? ` — réf. ${p.reference}` : ''}`} value={formatXOF(p.amount)} />
           ))}
+          {n(s.creditAmount) > 0 && <Row label="À crédit" value={formatXOF(s.creditAmount)} strong />}
           {n(s.changeGiven) > 0 && <Row label="Monnaie rendue" value={formatXOF(s.changeGiven)} />}
           {n(s.refundedTotal) > 0 && <Row label="Remboursé" value={`−${formatXOF(s.refundedTotal)}`} />}
+          {n(s.creditAmount) > 0 && <CreditInvoice sale={s} />}
         </div>
       </div>
       {s.cancelledAt && (

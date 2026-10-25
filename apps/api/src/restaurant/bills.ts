@@ -16,7 +16,7 @@ import { ArrayMaxSize, IsArray, IsInt, IsNumber, IsOptional, IsString, IsUUID, M
 import { AuditService } from '../audit/audit.service';
 import { AnyEstablishmentScope, AuthUser, CurrentUser, RequirePermissions } from '../auth/decorators';
 import { PrismaService, Tx } from '../prisma/prisma.service';
-import { PaymentDto, PresetSaleLine, SalesService } from '../sales/sales';
+import { CreditSaleDto, PaymentDto, PresetSaleLine, SalesService } from '../sales/sales';
 import { D, idempotent } from '../stock/common';
 import { assertAny, emptyToNull, lockOrders, nextRestaurantNumber, trim } from './common';
 import { isBillable, itemAmount, OrdersService } from './orders';
@@ -53,6 +53,8 @@ export class PayBillDto {
   @IsOptional() @IsNumber({ maxDecimalPlaces: 2 }) @Min(0.01) @Max(100) ticketDiscountPercent?: number;
   @IsOptional() @IsInt() @Min(1) @Max(1_000_000_000) ticketDiscountAmount?: number;
   @IsOptional() @Transform(emptyToNull) @IsString() @MaxLength(500) ticketDiscountReason?: string | null;
+  /** Vente à crédit : même contrat que la caisse (client obligatoire, encaissé + crédit = total, autorisation si dépassement). */
+  @IsOptional() @ValidateNested() @Type(() => CreditSaleDto) credit?: CreditSaleDto;
 }
 
 @Injectable()
@@ -227,6 +229,7 @@ export class BillsService implements OnModuleInit {
       ticketDiscountAmount: dto.ticketDiscountAmount,
       ticketDiscountReason: dto.ticketDiscountReason,
       payments: dto.payments,
+      credit: dto.credit,
       reference: `Commande ${bill.order.number}${table ? ` — Table ${table.code}` : ''}`,
       inTransaction: (tx, saleId) => this.markPaid(tx, me, id, saleId),
     });

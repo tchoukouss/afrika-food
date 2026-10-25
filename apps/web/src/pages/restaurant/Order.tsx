@@ -2,9 +2,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChefHat, GitBranch, Plus, Printer, Send, SlidersHorizontal, X } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import { CustomerPicker, useCustomerCredit } from '../../components/CustomerPicker';
 import { Alert, Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Textarea } from '../../components/ui';
 import { api, ApiError } from '../../lib/api';
+import { useAuth } from '../../lib/auth';
 import { qty } from '../../lib/catalog-types';
+import type { CreditOverride, Customer } from '../../lib/customer-types';
 import { formatDateTime, formatXOF } from '../../lib/format';
 import { Area, BILL_STATUS, ITEM_STATUS, LOSS_CAUSES_RESTAURANT, MenuEntry, newRequestId, ORDER_MODES, ORDER_STATUS, OrderDetail, OrderItem, OrderRow } from '../../lib/restaurant-types';
 import { CashSessionDetail, PrintJob, REFERENCE_REQUIRED, SaleResult, TicketText } from '../../lib/sales-types';
@@ -455,16 +458,32 @@ interface PayLine {
  */
 function PayBill({ order, billId, onClose, onDone }: { order: OrderDetail; billId: string; onClose: () => void; onDone: (d: OrderDetail) => void }) {
   const bill = order.bills.find((b) => b.id === billId)!;
+  const qc = useQueryClient();
+  const { can } = useAuth();
   const requestId = useRequestId();
   const session = useQuery({ queryKey: ['cash-sessions', 'current'], queryFn: () => api.get<{ session: CashSessionDetail | null }>('/cash-sessions/current', { noEstablishment: true }) });
   const [discount, setDiscount] = useState({ amount: '', reason: '' });
+  // Remise déduite avant tout calcul (paiements comme crédit).
   const total = n(bill.total) - (Number(discount.amount) || 0);
   const [lines, setLines] = useState<PayLine[]>([{ method: 'CASH', amount: String(bill.total), reference: '' }]);
   const [result, setResult] = useState<(SaleResult & { order: OrderDetail }) | null>(null);
+  const [resultCustomer, setResultCustomer] = useState<Customer | null>(null);
   const [job, setJob] = useState<PrintJob | null>(null);
+  // Vente à crédit (module 7) : part de l'addition mise en créance sur un client, jamais un moyen de paiement.
+  const [creditOn, setCreditOn] = useState(false);
+  const [customer, setCustomer] = useState<Customer | null>(null);
+  const [creditInput, setCreditInput] = useState('');
+  const [overrideId, setOverrideId] = useState('');
   const paid = lines.reduce((s, l) => s + (Number(l.amount) || 0), 0);
   const cash = lines.filter((l) => l.method === 'CASH').reduce((s, l) => s + (Number(l.amount) || 0), 0);
-  const change = Math.max(0, paid - total);
+  const credit = creditOn ? Math.round(Number(creditInput) || 0) : 0;
+  const rest = total - paid - credit;
+  // Avec une part à crédit, payé + crédit = total exactement : aucune monnaie rendue.
+  const change = credit > 0 ? 0 : Math.max(0, paid - total);
+  const creditError =
+    credit <= 0 ? null : !customer ? 'Choisissez le client pour la part à crédit.' : credit > total ? 'La part à crédit dépasse le total.' : paid + credit !== total ? 'Payé + à crédit doit faire exactement le total.' : null;
+  // Le FCFA n'a pas de centimes : tout montant saisi doit être entier (jamais arrondi en silence à l'envoi).
+  const nonInteger = [...lines.map((l) => l.amount), discount.amount, ...(creditOn ? [creditInput] : [])].some((v) => v.trim() !== '' && !Number.isInteger(Number(v)));
   const split = (parts: number) => {
     const share = Math.floor(total / parts);
     setLines(Array.from({ length: parts }, (_, i) => ({ method: 'CASH', amount: String(i === parts - 1 ? total - share * (parts - 1) : share), reference: '' })));
@@ -476,23 +495,44 @@ function PayBill({ order, billId, onClose, onDone }: { order: OrderDetail; billI
         sessionId: session.data?.session?.id,
         payments: lines.filter((l) => Number(l.amount) > 0).map((l) => ({ method: l.method, amount: Math.round(Number(l.amount)), ...(l.reference.trim() ? { reference: l.reference.trim() } : {}) })),
         ...(Number(discount.amount) > 0 ? { ticketDiscountAmount: Math.round(Number(discount.amount)), ticketDiscountReason: discount.reason } : {}),
+        ...(credit > 0 && customer ? { credit: { customerId: customer.id, amount: credit, ...(overrideId ? { overrideId } : {}) } } : {}),
       }),
     onSuccess: (r) => {
       setResult(r);
+      setResultCustomer(credit > 0 ? customer : null);
       setJob(r.print);
       onDone(r.order);
+      if (credit > 0) qc.invalidateQueries({ queryKey: ['customer-credit'] });
       if (r.print?.status === 'BROWSER') printLines(r.ticket.lines, r.ticket.width, r.sale.number);
     },
   });
+  const errorCode = (pay.error as ApiError | null)?.code;
   if (session.isLoading) return null;
   const s = session.data?.session;
   return (
     <Modal open wide title={result ? `Ticket ${result.sale.number}` : `Encaisser l’addition ${bill.number}`} onClose={onClose}>
       {result ? (
         <div className="space-y-3">
-          <div className="rounded-lg bg-green-50 p-3 text-center">
-            Monnaie à rendre<div className="text-xl font-bold text-green-700">{formatXOF(result.sale.changeGiven)}</div>
-          </div>
+          {n(result.sale.creditAmount ?? 0) > 0 ? (
+            <>
+              <div className="grid grid-cols-3 gap-2 rounded-lg bg-stone-50 p-3 text-center text-sm">
+                <div>
+                  Total<div className="text-lg font-bold">{formatXOF(result.sale.total)}</div>
+                </div>
+                <div>
+                  Payé<div className="text-lg font-bold">{formatXOF(n(result.sale.paidTotal) - n(result.sale.changeGiven))}</div>
+                </div>
+                <div>
+                  À crédit<div className="text-lg font-bold text-brand-700">{formatXOF(result.sale.creditAmount)}</div>
+                </div>
+              </div>
+              {resultCustomer && <CreditInvoice saleId={result.sale.id} customer={resultCustomer} establishmentId={order.establishmentId} />}
+            </>
+          ) : (
+            <div className="rounded-lg bg-green-50 p-3 text-center">
+              Monnaie à rendre<div className="text-xl font-bold text-green-700">{formatXOF(result.sale.changeGiven)}</div>
+            </div>
+          )}
           <PrintStatus job={job} ticket={result.ticket as TicketText} onDone={setJob} />
           <TicketPreview ticket={result.ticket} />
           <div className="flex justify-end">
@@ -541,15 +581,78 @@ function PayBill({ order, billId, onClose, onDone }: { order: OrderDetail; billI
             </div>
           ))}
           <div className="flex flex-wrap gap-2">
-            <Button type="button" variant="ghost" onClick={() => setLines([...lines, { method: 'WAVE', amount: String(Math.max(0, total - paid)), reference: '' }])}>
+            <Button type="button" variant="ghost" onClick={() => setLines([...lines, { method: 'WAVE', amount: String(Math.max(0, total - paid - credit)), reference: '' }])}>
               <Plus className="size-4" /> Autre paiement
             </Button>
             {[2, 3, 4].map((p) => (
-              <Button key={p} type="button" variant="secondary" onClick={() => split(p)}>
+              // Partage : répartit tout le total en espèces, sans objet en mode crédit.
+              <Button key={p} type="button" variant="secondary" disabled={creditOn} onClick={() => split(p)}>
                 Partager en {p}
               </Button>
             ))}
+            {can('customers.view') && (
+              <Button
+                type="button"
+                variant={creditOn ? 'secondary' : 'ghost'}
+                onClick={() => {
+                  if (creditOn) {
+                    setCreditOn(false);
+                    setOverrideId('');
+                    pay.reset(); // l'erreur d'un essai à crédit (409…) ne concerne plus le paiement normal
+                    // Paiement insuffisant hors crédit (ex. après « Tout à crédit ») : retour au paiement complet en espèces.
+                    if (paid < total) setLines([{ method: 'CASH', amount: String(total), reference: '' }]);
+                  } else {
+                    setCreditOn(true);
+                    setCreditInput(String(Math.max(0, total - paid)));
+                  }
+                }}
+              >
+                {creditOn ? 'Sans crédit' : 'Vente à crédit'}
+              </Button>
+            )}
           </div>
+          {creditOn && (
+            <div className="space-y-2 rounded-lg border border-stone-200 p-3">
+              <CustomerPicker
+                establishmentId={order.establishmentId}
+                value={customer}
+                onChange={(c) => {
+                  setCustomer(c);
+                  setOverrideId('');
+                }}
+                amount={credit}
+              />
+              <div className="flex flex-wrap items-end gap-2">
+                <Field label="Part à crédit (FCFA)">
+                  <Input
+                    className="w-36"
+                    type="number"
+                    min={0}
+                    max={total}
+                    step={1}
+                    value={creditInput}
+                    onChange={(e) => {
+                      setCreditInput(e.target.value);
+                      setOverrideId('');
+                    }}
+                  />
+                </Field>
+                <Button type="button" variant="secondary" onClick={() => setCreditInput(String(Math.max(0, total - paid)))}>
+                  Reste à crédit
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => {
+                    setLines([{ method: 'CASH', amount: '0', reference: '' }]);
+                    setCreditInput(String(total));
+                  }}
+                >
+                  Tout à crédit
+                </Button>
+              </div>
+            </div>
+          )}
           {order.rights.discount && (
             <div className="flex flex-wrap gap-2">
               <Field label="Remise (FCFA)">
@@ -560,30 +663,117 @@ function PayBill({ order, billId, onClose, onDone }: { order: OrderDetail; billI
               </Field>
             </div>
           )}
-          <div className="grid grid-cols-3 gap-2 rounded-lg bg-stone-50 p-3 text-center text-sm">
-            <div>
-              Reçu<div className="font-bold">{formatXOF(paid)}</div>
+          {creditOn ? (
+            <div className={`grid grid-cols-2 gap-2 rounded-lg bg-stone-50 p-3 text-center text-sm ${credit === 0 ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
+              <div>
+                Total<div className="font-bold">{formatXOF(total)}</div>
+              </div>
+              <div>
+                Payé<div className="font-bold">{formatXOF(paid)}</div>
+              </div>
+              <div>
+                À crédit<div className="font-bold text-brand-700">{formatXOF(credit)}</div>
+              </div>
+              <div>
+                Reste
+                {credit === 0 ? (
+                  // Sans part à crédit, mêmes règles que le paiement normal : un trop-perçu est de la monnaie.
+                  <div className={`font-bold ${paid < total ? 'text-red-700' : 'text-green-700'}`}>{formatXOF(Math.max(0, total - paid))}</div>
+                ) : (
+                  <div className={`font-bold ${rest !== 0 ? 'text-red-700' : 'text-green-700'}`}>{rest < 0 ? `−${formatXOF(-rest)}` : formatXOF(rest)}</div>
+                )}
+              </div>
+              {credit === 0 && (
+                <div>
+                  Monnaie<div className="font-bold text-green-700">{formatXOF(change)}</div>
+                </div>
+              )}
             </div>
-            <div>
-              Reste<div className={`font-bold ${paid < total ? 'text-red-700' : ''}`}>{formatXOF(Math.max(0, total - paid))}</div>
+          ) : (
+            <div className="grid grid-cols-3 gap-2 rounded-lg bg-stone-50 p-3 text-center text-sm">
+              <div>
+                Reçu<div className="font-bold">{formatXOF(paid)}</div>
+              </div>
+              <div>
+                Reste<div className={`font-bold ${paid < total ? 'text-red-700' : ''}`}>{formatXOF(Math.max(0, total - paid))}</div>
+              </div>
+              <div>
+                Monnaie<div className="font-bold text-green-700">{formatXOF(change)}</div>
+              </div>
             </div>
-            <div>
-              Monnaie<div className="font-bold text-green-700">{formatXOF(change)}</div>
-            </div>
-          </div>
+          )}
+          {nonInteger && <Alert>Montants en FCFA entiers uniquement (pas de centimes).</Alert>}
+          {creditError && <Alert tone="info">{creditError}</Alert>}
           {change > cash && <Alert>La monnaie ne se rend qu’en espèces.</Alert>}
           {pay.error && <Alert>{(pay.error as ApiError).message}</Alert>}
+          {credit > 0 && customer && (errorCode === 'CREDIT_LIMIT_EXCEEDED' || errorCode === 'CREDIT_OVERRIDE_INVALID' || overrideId) && (
+            <OverrideChoice customer={customer} establishmentId={order.establishmentId} amount={credit} value={overrideId} onChange={setOverrideId} />
+          )}
           <div className="flex justify-end gap-2">
             <Button type="button" variant="ghost" onClick={onClose}>
               Retour
             </Button>
-            <Button type="submit" loading={pay.isPending} disabled={paid < total || change > cash}>
+            <Button type="submit" loading={pay.isPending} disabled={nonInteger || (credit > 0 ? !!creditError : paid < total || change > cash)}>
               Valider l’encaissement
             </Button>
           </div>
         </form>
       )}
     </Modal>
+  );
+}
+
+/**
+ * Limite de crédit dépassée (409) : choix d'une pré-autorisation déjà accordée
+ * par un responsable (fiche client) pour ce client, cet établissement et ce montant.
+ * Même mécanisme que la caisse ; le serveur la consomme et reste seul juge.
+ */
+function OverrideChoice({ customer, establishmentId, amount, value, onChange }: { customer: Customer; establishmentId: string; amount: number; value: string; onChange: (id: string) => void }) {
+  const credit = useCustomerCredit(customer.id, establishmentId);
+  const list = useQuery({
+    queryKey: ['customer-credit-overrides', customer.id],
+    queryFn: () => api.get<CreditOverride[]>(`/customers/${customer.id}/credit-overrides`),
+    staleTime: 0,
+  });
+  if (list.isLoading) return <Spinner />;
+  if (list.error) return <Alert>{(list.error as ApiError).message}</Alert>;
+  const usable = (list.data ?? []).filter((o) => o.status === 'ACTIVE' && o.establishmentId === establishmentId && Number(o.maxAmount) >= amount);
+  if (usable.length === 0) {
+    const hidden = (credit.data?.activeOverrides ?? 0) > 0 && (list.data ?? []).length === 0;
+    return (
+      <Alert tone="info">
+        {hidden
+          ? 'Une autorisation de dépassement est active pour ce client, mais votre rôle ne permet pas de la consulter : un responsable doit valider ce paiement.'
+          : `Aucune autorisation de dépassement active couvrant ${formatXOF(amount)} dans cet établissement. Un responsable peut en accorder une depuis la fiche client (menu Clients), puis réessayez.`}
+      </Alert>
+    );
+  }
+  return (
+    <Field label="Autorisation de dépassement">
+      <Select value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">— Choisir une autorisation —</option>
+        {usable.map((o) => (
+          <option key={o.id} value={o.id}>
+            Jusqu’à {formatXOF(o.maxAmount)} · {o.reason} · {o.approvedBy ?? '—'} · expire {new Date(o.expiresAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}
+          </option>
+        ))}
+      </Select>
+    </Field>
+  );
+}
+
+/** Facture créée par un paiement à crédit : retrouvée dans les factures du client (la réponse ne la contient pas). */
+function CreditInvoice({ saleId, customer, establishmentId }: { saleId: string; customer: Customer; establishmentId: string }) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['invoices', 'sale', saleId],
+    queryFn: () => api.get<{ id: string; number: string | null; saleId: string | null }[]>(`/invoices?customerId=${customer.id}&establishmentId=${establishmentId}`),
+  });
+  const invoice = data?.find((i) => i.saleId === saleId);
+  return (
+    <div className="text-sm">
+      Client : <strong>{customer.name}</strong> · Facture :{' '}
+      {isLoading ? '…' : error ? <span className="text-red-700">{(error as ApiError).message}</span> : <strong>{invoice?.number ?? 'non trouvée'}</strong>}
+    </div>
   );
 }
 

@@ -63,6 +63,20 @@ export class PaymentDto {
   @IsOptional() @Transform(emptyToNull) @IsString() @MaxLength(100) reference?: string | null;
 }
 
+/**
+ * Part du ticket mise à crédit (vente à crédit) : jamais un moyen de paiement.
+ * Le traitement de la créance (contrôle de limite, facture) est fourni par le
+ * module des clients ; sans lui, une vente à crédit est refusée.
+ */
+export class CreditSaleDto {
+  /** Client obligatoire pour toute vente à crédit. */
+  @IsUUID() customerId: string;
+  /** Montant à crédit (FCFA), explicite : encaissé + crédit doit faire exactement le total. 0 = vente normale. */
+  @IsInt() @Min(0) @Max(MAX_AMOUNT) amount: number;
+  /** Autorisation de dépassement de la limite de crédit (« credit.override »), si nécessaire. */
+  @IsOptional() @IsUUID() overrideId?: string;
+}
+
 export class CreateSaleDto {
   @IsOptional() @IsUUID() clientRequestId?: string;
   @IsUUID() sessionId: string;
@@ -71,6 +85,7 @@ export class CreateSaleDto {
   @IsOptional() @IsInt() @Min(1) @Max(MAX_AMOUNT) ticketDiscountAmount?: number;
   @IsOptional() @Transform(emptyToNull) @IsString() @MaxLength(500) ticketDiscountReason?: string | null;
   @IsArray() @ArrayMaxSize(10) @ValidateNested({ each: true }) @Type(() => PaymentDto) payments: PaymentDto[];
+  @IsOptional() @ValidateNested() @Type(() => CreditSaleDto) credit?: CreditSaleDto;
 }
 
 export class CancelSaleDto {
@@ -166,6 +181,8 @@ export interface PresetSaleInput {
   ticketDiscountAmount?: number;
   ticketDiscountReason?: string | null;
   payments: PaymentDto[];
+  /** Part mise à crédit (même règle que la caisse). */
+  credit?: CreditSaleDto;
   /** Mention imprimée sur le ticket, ex. « Commande PLT-RST-2026-000004 — Table 12 ». */
   reference: string;
   /** Exécuté dans la transaction de la vente (ex. marquer l'addition payée). */
@@ -174,6 +191,26 @@ export interface PresetSaleInput {
 
 /** Appelé dans la transaction d'annulation d'une vente (module 6 : rouvrir l'addition). */
 export type SaleCancelHook = (tx: Tx, me: AuthUser, sale: Sale) => Promise<void>;
+
+/** Ticket vendu en partie ou en totalité à crédit, transmis au traitement de la créance. */
+export interface CreditSale {
+  id: string;
+  number: string;
+  establishmentId: string;
+  customerId: string;
+  total: bigint;
+  /** Part réellement encaissée (après monnaie rendue). */
+  collected: bigint;
+  creditAmount: bigint;
+  overrideId: string | null;
+}
+
+/**
+ * Appelé dans la transaction de la vente, après le ticket, ses paiements et
+ * ses mouvements de caisse : contrôle du crédit et facture du ticket. Une
+ * erreur annule toute la vente.
+ */
+export type CreditSaleHandler = (tx: Tx, me: AuthUser, sale: CreditSale) => Promise<{ invoiceId: string; invoiceNumber: string }>;
 
 const discountOf = (base: bigint, percent?: number, amount?: number) => {
   if (percent !== undefined && amount !== undefined) throw new BadRequestException('Remise : indiquer un pourcentage OU un montant');
@@ -201,8 +238,26 @@ export class SalesService {
     this.ticketReferences.push(resolver);
   }
 
+  private readonly ticketInvoices: ((saleId: string) => Promise<string | null>)[] = [];
+
+  /** Numéro de la facture d'une vente à crédit, imprimé sur son ticket (module des clients). */
+  registerTicketInvoice(resolver: (saleId: string) => Promise<string | null>) {
+    this.ticketInvoices.push(resolver);
+  }
+
   registerCancelHook(hook: SaleCancelHook) {
     this.cancelHooks.push(hook);
+  }
+
+  private creditHandler: CreditSaleHandler | null = null;
+
+  /** Traitement unique des ventes à crédit (module des clients) ; renvoie la fonction qui le retire. */
+  registerCreditSaleHandler(handler: CreditSaleHandler): () => void {
+    if (this.creditHandler) throw new Error('Un traitement des ventes à crédit est déjà enregistré');
+    this.creditHandler = handler;
+    return () => {
+      if (this.creditHandler === handler) this.creditHandler = null;
+    };
   }
 
   // --- Calcul du ticket --------------------------------------------------------------
@@ -342,8 +397,10 @@ export class SalesService {
   }
 
   /** Paiements : plusieurs moyens possibles, monnaie rendue uniquement sur les espèces (décision 11). */
-  private checkPayments(total: bigint, payments: PaymentDto[]) {
-    if (total > 0n && payments.length === 0) throw new BadRequestException('Paiement manquant');
+  private checkPayments(total: bigint, payments: PaymentDto[], credit?: CreditSaleDto) {
+    const creditAmount = BigInt(credit?.amount ?? 0);
+    if (creditAmount > total) throw new BadRequestException(`Montant à crédit supérieur au total du ticket (${total} FCFA)`);
+    if (total - creditAmount > 0n && payments.length === 0) throw new BadRequestException('Paiement manquant');
     const confirmed = payments.map((p) => {
       const amount = BigInt(p.amount);
       const provider = providerFor(p.method);
@@ -353,13 +410,22 @@ export class SalesService {
     const other = confirmed.filter((p) => p.method !== 'CASH').reduce((s, p) => s + p.amount, 0n);
     if (other > total) throw new BadRequestException('Les paiements hors espèces dépassent le total : la monnaie ne se rend qu’en espèces');
     const paid = cash + other;
+    if (creditAmount > 0n) {
+      // Vente à crédit : encaissé + crédit = total exactement, sans monnaie rendue.
+      if (paid + creditAmount !== total) {
+        throw new BadRequestException(`Encaissé (${paid} FCFA) + crédit (${creditAmount} FCFA) doit faire exactement le total (${total} FCFA)`);
+      }
+      const kept = new Map<PaymentMethod, bigint>();
+      for (const p of confirmed) kept.set(p.method, (kept.get(p.method) ?? 0n) + p.amount);
+      return { confirmed, paid, change: 0n, kept, creditAmount };
+    }
     if (paid < total) throw new BadRequestException(`Paiement insuffisant : il manque ${total - paid} FCFA`);
     const change = paid - total;
     // Encaissé réellement par moyen (espèces : après rendu de monnaie).
     const kept = new Map<PaymentMethod, bigint>();
     for (const p of confirmed) kept.set(p.method, (kept.get(p.method) ?? 0n) + p.amount);
     if (cash > 0n) kept.set('CASH', cash - change);
-    return { confirmed, paid, change, kept };
+    return { confirmed, paid, change, kept, creditAmount: 0n };
   }
 
   // --- Encaissement ---------------------------------------------------------------------
@@ -372,7 +438,7 @@ export class SalesService {
         this.prisma.sale
           .findFirst({ where: { companyId: me.companyId, clientRequestId: dto.clientRequestId } })
           .then((s) => s && { id: s.id, ownerId: s.cashierId }),
-      () => this.recordSale(me, { sessionId: dto.sessionId, clientRequestId: dto.clientRequestId, payments: dto.payments, price: (estId) => this.priceLines(me, estId, dto) }),
+      () => this.recordSale(me, { sessionId: dto.sessionId, clientRequestId: dto.clientRequestId, payments: dto.payments, credit: dto.credit, price: (estId) => this.priceLines(me, estId, dto) }),
       (id) => this.saleResult(me, id, null),
     );
   }
@@ -396,6 +462,7 @@ export class SalesService {
           sessionId: input.sessionId,
           clientRequestId: input.clientRequestId,
           payments: input.payments,
+          credit: input.credit,
           price: async () => this.presetLines(input.lines, input),
           reference: input.reference,
           inTransaction: input.inTransaction,
@@ -410,6 +477,7 @@ export class SalesService {
       sessionId: string;
       clientRequestId?: string;
       payments: PaymentDto[];
+      credit?: CreditSaleDto;
       price: (establishmentId: string) => Promise<Priced>;
       reference?: string;
       inTransaction?: (tx: Tx, saleId: string) => Promise<void>;
@@ -424,7 +492,10 @@ export class SalesService {
     if (!session.register.isActive) throw new ConflictException('Caisse désactivée');
     const priced = await dto.price(session.establishmentId);
     if (priced.anyDiscount) assertCan(me, session.establishmentId, 'sales.discount');
-    const pay = this.checkPayments(priced.total, dto.payments);
+    const pay = this.checkPayments(priced.total, dto.payments, dto.credit);
+    // Vente à crédit : le traitement de la créance doit exister avant d'attribuer un numéro de ticket.
+    const handler = pay.creditAmount > 0n ? this.creditHandler : null;
+    if (pay.creditAmount > 0n && !handler) throw new BadRequestException('Vente à crédit indisponible : le module des clients n’est pas actif');
     const est = await this.prisma.establishment.findUniqueOrThrow({ where: { id: session.establishmentId } });
 
     // Numéro unique, jamais réutilisé, attribué hors transaction : la séquence
@@ -481,6 +552,7 @@ export class SalesService {
             taxTotal: priced.taxTotal,
             paidTotal: pay.paid,
             changeGiven: pay.change,
+            creditAmount: pay.creditAmount,
             costTotal,
           },
         });
@@ -519,12 +591,26 @@ export class SalesService {
               discounts: priced.lineDiscountTotal + priced.ticketDiscountAmount,
               payments: pay.confirmed.map((p) => ({ method: p.method, amount: p.amount, reference: p.reference })),
               change: pay.change,
+              ...(pay.creditAmount > 0n ? { credit: { customerId: dto.credit!.customerId, amount: pay.creditAmount, overrideId: dto.credit!.overrideId ?? null } } : {}),
               ...(dto.reference ? { reference: dto.reference } : {}),
             },
             reason: priced.ticketDiscountReason,
           },
           tx,
         );
+        // Part à crédit : créance du module des clients, dans la même transaction (aucun mouvement de caisse).
+        if (handler) {
+          await handler(tx, me, {
+            id: saleId,
+            number,
+            establishmentId: est.id,
+            customerId: dto.credit!.customerId,
+            total: priced.total,
+            collected: pay.paid - pay.change,
+            creditAmount: pay.creditAmount,
+            overrideId: dto.credit!.overrideId ?? null,
+          });
+        }
         if (dto.inTransaction) await dto.inTransaction(tx, saleId);
         return this.createPrintJob(tx, me, { id: saleId, establishmentId: est.id, registerId: s.registerId }, s.register, 'TICKET', false);
       });
@@ -603,6 +689,9 @@ export class SalesService {
     ]);
     let reference: string | null = null;
     for (const resolve of this.ticketReferences) reference ??= await resolve(sale.id);
+    // Facture cherchée seulement pour une vente à crédit : le ticket d'une vente normale ne change pas.
+    let invoiceNumber: string | null = null;
+    if (sale.creditAmount > 0n) for (const resolve of this.ticketInvoices) invoiceNumber ??= await resolve(sale.id);
     return {
       paperWidth: register.paperWidth,
       data: {
@@ -623,6 +712,8 @@ export class SalesService {
         payments: sale.payments,
         changeGiven: sale.changeGiven,
         refundedTotal: sale.refundedTotal,
+        creditAmount: sale.creditAmount,
+        invoiceNumber,
       },
     };
   }

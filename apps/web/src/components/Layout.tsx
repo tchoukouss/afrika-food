@@ -1,5 +1,6 @@
 import {
   ArrowLeftRight,
+  Banknote,
   BookOpen,
   Boxes,
   Building2,
@@ -8,8 +9,10 @@ import {
   ChefHat,
   ClipboardCheck,
   ClipboardList,
+  Contact,
   Croissant,
   Factory,
+  FileText,
   GitBranch,
   Home,
   KeyRound,
@@ -36,13 +39,14 @@ import {
 import { ReactNode, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
+import { INVOICE_READ, PAYMENT_READ } from '../lib/invoice-types';
 
 interface NavItem {
   to: string;
   label: string;
   icon: ReactNode;
-  /** Permission requise (n'importe quel établissement) ; absent = toujours visible. */
-  permission?: string;
+  /** Permission requise (n'importe quel établissement), ou l'une d'une liste ; absent = toujours visible. */
+  permission?: string | string[];
 }
 
 // Seuls les modules réellement développés apparaissent dans le menu.
@@ -97,6 +101,14 @@ const NAV: { section: string; items: NavItem[] }[] = [
     ],
   },
   {
+    section: 'Clients',
+    items: [
+      { to: '/clients', label: 'Clients', icon: <Contact className="size-4" />, permission: 'customers.view' },
+      { to: '/factures-clients', label: 'Facturation', icon: <FileText className="size-4" />, permission: INVOICE_READ },
+      { to: '/paiements-clients', label: 'Paiements clients', icon: <Banknote className="size-4" />, permission: PAYMENT_READ },
+    ],
+  },
+  {
     section: 'Administration',
     items: [
       { to: '/etablissements', label: 'Établissements', icon: <Building2 className="size-4" />, permission: 'establishments.view' },
@@ -141,7 +153,7 @@ export function Layout() {
       <EstablishmentSwitcher />
       <div className="flex-1 space-y-4 overflow-y-auto">
         {NAV.map((group) => {
-          const items = group.items.filter((i) => !i.permission || canAnywhere(i.permission));
+          const items = group.items.filter((i) => !i.permission || (Array.isArray(i.permission) ? i.permission : [i.permission]).some((p) => canAnywhere(p)));
           if (items.length === 0) return null;
           return (
             <div key={group.section}>

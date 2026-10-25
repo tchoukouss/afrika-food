@@ -33,6 +33,9 @@ export interface TicketData {
   payments: { method: keyof typeof METHOD_LABELS; amount: bigint; reference: string | null }[];
   changeGiven: bigint;
   refundedTotal: bigint;
+  /** Part vendue à crédit (0 = vente normale) et facture de la créance, si émise. */
+  creditAmount: bigint;
+  invoiceNumber?: string | null;
 }
 
 export const money = (v: bigint | number) => `${String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')} F`;
@@ -116,6 +119,10 @@ export function renderTicket(t: TicketData, opts: { width: number; duplicate?: b
   for (const p of t.payments) {
     lr(METHOD_LABELS[p.method], money(p.amount));
     if (p.reference) lines.push(`  Réf. ${p.reference}`.slice(0, W));
+  }
+  if (t.creditAmount > 0n) {
+    lr('À crédit', money(t.creditAmount));
+    if (t.invoiceNumber) lr('Facture', t.invoiceNumber);
   }
   if (t.changeGiven > 0n) lr('Monnaie rendue', money(t.changeGiven));
   if (t.refundedTotal > 0n) lr('Remboursé', `-${money(t.refundedTotal)}`);

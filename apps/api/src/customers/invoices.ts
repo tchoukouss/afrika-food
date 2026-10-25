@@ -7,6 +7,7 @@ import { AuditService } from '../audit/audit.service';
 import { AnyEstablishmentScope, AuthUser, CurrentUser, RequirePermissions } from '../auth/decorators';
 import { Db, PrismaService, Tx } from '../prisma/prisma.service';
 import { METHOD_LABELS, providerFor, roundXof } from '../sales/common';
+import { CreditSale, SalesService } from '../sales/sales';
 import { customerCashMovement } from '../sales/sessions';
 import { SequenceService } from '../sequences/sequence.service';
 import { D, idempotent, userNames } from '../stock/common';
@@ -161,10 +162,21 @@ export class InvoicesService implements OnModuleInit {
     private readonly sequences: SequenceService,
     private readonly credit: CustomerCreditService,
     private readonly payments: CustomerPaymentsService,
+    private readonly sales: SalesService,
   ) {}
 
-  /** Encours du client : reste dû des factures émises ou en litige (base du contrôle de crédit). */
+  /**
+   * Encours du client : reste dû des factures émises ou en litige (base du
+   * contrôle de crédit). Vente à crédit : traitement de la créance d'un ticket,
+   * enregistré auprès de la caisse (module 7 → module 5).
+   */
   onModuleInit() {
+    this.sales.registerCreditSaleHandler((tx, me, sale) => this.creditSale(tx, me, sale));
+    // Ticket d'une vente à crédit : numéro de sa facture émise (jamais une facture annulée).
+    this.sales.registerTicketInvoice(async (saleId) => {
+      const inv = await this.prisma.invoice.findFirst({ where: { saleId, number: { not: null }, status: { not: 'CANCELLED' } }, select: { number: true } });
+      return inv?.number ?? null;
+    });
     this.credit.registerOutstandingSource(async (db, customerId) => {
       const open = await db.invoice.findMany({ where: { customerId, status: { in: OPEN } }, select: { id: true, status: true, total: true, posPaidAmount: true, dueDate: true } });
       if (!open.length) return 0n;
@@ -261,7 +273,7 @@ export class InvoicesService implements OnModuleInit {
     );
   }
 
-  private async doCreate(tx: Tx, me: AuthUser, dto: CreateInvoiceDto) {
+  private async doCreate(tx: Tx, me: AuthUser, dto: CreateInvoiceDto, opts: { posPaidAmount?: bigint } = {}) {
     const est = await tx.establishment.findFirst({ where: { id: dto.establishmentId, companyId: me.companyId, deletedAt: null } });
     if (!est) throw new BadRequestException('Établissement invalide');
     let customerId: string;
@@ -336,7 +348,9 @@ export class InvoicesService implements OnModuleInit {
         saleItemId: i.id,
       }));
       // Déjà encaissé à la caisse : la facture ne crée ni vente ni encaissement.
-      posPaidAmount = sale.total;
+      // Vente à crédit : seule la part encaissée ; le reste du ticket est dû par le client.
+      posPaidAmount = opts.posPaidAmount ?? sale.total;
+      if (posPaidAmount < 0n || posPaidAmount > sale.total) throw new BadRequestException('Part encaissée incohérente avec le ticket');
     } else {
       if (!dto.customerId) throw new BadRequestException('Client obligatoire');
       customerId = (await activeCustomer(tx, me, dto.customerId)).id;
@@ -407,31 +421,72 @@ export class InvoicesService implements OnModuleInit {
     await this.prisma.$transaction(async (tx) => {
       const inv = await this.locked(tx, me, id);
       this.assertCan(me, inv.establishmentId, MANAGE);
-      if (inv.status !== 'DRAFT') throw new ConflictException(inv.status === 'CANCELLED' ? 'Brouillon abandonné' : 'Facture déjà émise');
-      if (inv.orderId) {
-        await lockRowOf(tx, 'customer_orders', inv.orderId);
-        const order = await tx.customerOrder.findUniqueOrThrow({ where: { id: inv.orderId } });
-        if (!INVOICEABLE_ORDER.includes(order.status)) throw new ConflictException(`Commande ${order.number} annulée : facture impossible`);
-      }
-      if (inv.saleId) {
-        // Même verrou que l'annulation et le remboursement du ticket au module 5.
-        await tx.$queryRaw`SELECT id FROM sales WHERE id = ${inv.saleId}::uuid FOR UPDATE`;
-        const sale = await tx.sale.findUniqueOrThrow({ where: { id: inv.saleId } });
-        if (sale.status !== 'COMPLETED') throw new ConflictException(`Ticket ${sale.number} annulé ou remboursé : facture impossible`);
-      }
-      const customer = await activeCustomer(tx, me, inv.customerId);
-      const est = await tx.establishment.findUniqueOrThrow({ where: { id: inv.establishmentId } });
-      const issuedAt = new Date();
-      const paymentTermDays = inv.source === 'SALE' ? 0 : customer.paymentTermDays;
-      const number = await this.sequences.next(tx, { companyId: me.companyId, docType: 'INVOICE', establishmentId: est.id, establishmentCode: est.code, date: issuedAt });
-      const dueDate = addDays(issuedAt.toISOString().slice(0, 10), paymentTermDays);
-      await tx.invoice.update({ where: { id }, data: { status: 'ISSUED', number, issuedAt, issuedById: me.userId, paymentTermDays, dueDate } });
-      await this.audit.record(
-        { action: 'INVOICE_ISSUED', entityType: 'Invoice', entityId: id, establishmentId: est.id, oldValues: { status: 'DRAFT' }, newValues: { number, total: inv.total, taxTotal: inv.taxTotal, dueDate: dueDate.toISOString().slice(0, 10), paymentTermDays } },
-        tx,
-      );
+      await this.issueLocked(tx, me, inv);
     });
     return this.get(me, id);
+  }
+
+  /** Émission d'une facture déjà verrouillée, dans la transaction de l'appelant (droits contrôlés par l'appelant). */
+  private async issueLocked(tx: Tx, me: AuthUser, inv: Invoice) {
+    const id = inv.id;
+    if (inv.status !== 'DRAFT') throw new ConflictException(inv.status === 'CANCELLED' ? 'Brouillon abandonné' : 'Facture déjà émise');
+    if (inv.orderId) {
+      await lockRowOf(tx, 'customer_orders', inv.orderId);
+      const order = await tx.customerOrder.findUniqueOrThrow({ where: { id: inv.orderId } });
+      if (!INVOICEABLE_ORDER.includes(order.status)) throw new ConflictException(`Commande ${order.number} annulée : facture impossible`);
+    }
+    if (inv.saleId) {
+      // Même verrou que l'annulation et le remboursement du ticket au module 5.
+      await tx.$queryRaw`SELECT id FROM sales WHERE id = ${inv.saleId}::uuid FOR UPDATE`;
+      const sale = await tx.sale.findUniqueOrThrow({ where: { id: inv.saleId } });
+      if (sale.status !== 'COMPLETED') throw new ConflictException(`Ticket ${sale.number} annulé ou remboursé : facture impossible`);
+    }
+    const customer = await activeCustomer(tx, me, inv.customerId);
+    const est = await tx.establishment.findUniqueOrThrow({ where: { id: inv.establishmentId } });
+    const issuedAt = new Date();
+    // Ticket entièrement réglé en caisse : échéance immédiate ; ticket en partie à crédit : conditions du client.
+    const paymentTermDays = inv.source === 'SALE' && inv.posPaidAmount >= inv.total ? 0 : customer.paymentTermDays;
+    const number = await this.sequences.next(tx, { companyId: me.companyId, docType: 'INVOICE', establishmentId: est.id, establishmentCode: est.code, date: issuedAt });
+    const dueDate = addDays(issuedAt.toISOString().slice(0, 10), paymentTermDays);
+    await tx.invoice.update({ where: { id }, data: { status: 'ISSUED', number, issuedAt, issuedById: me.userId, paymentTermDays, dueDate } });
+    await this.audit.record(
+      { action: 'INVOICE_ISSUED', entityType: 'Invoice', entityId: id, establishmentId: est.id, oldValues: { status: 'DRAFT' }, newValues: { number, total: inv.total, taxTotal: inv.taxTotal, dueDate: dueDate.toISOString().slice(0, 10), paymentTermDays } },
+      tx,
+    );
+    return number;
+  }
+
+  /**
+   * Vente à crédit, dans la transaction du ticket (module 5) : contrôle de la
+   * limite sur la seule part à crédit (autorisation de dépassement consommée
+   * si nécessaire), puis facture du ticket émise avec la part encaissée comme
+   * déjà réglée. Le ticket reste l'unique vente ; la facture ne crée ni vente
+   * ni encaissement. Toute erreur annule la vente entière.
+   */
+  private async creditSale(tx: Tx, me: AuthUser, sale: CreditSale) {
+    if (sale.collected + sale.creditAmount !== sale.total) throw new BadRequestException('Vente à crédit incohérente : encaissé + crédit ≠ total');
+    const decision = await this.credit.check(tx, me, {
+      customerId: sale.customerId,
+      establishmentId: sale.establishmentId,
+      amount: sale.creditAmount,
+      overrideId: sale.overrideId,
+      reference: `Ticket ${sale.number}`,
+    });
+    const invoiceId = await this.doCreate(tx, me, { source: 'SALE', establishmentId: sale.establishmentId, customerId: sale.customerId, saleId: sale.id } as CreateInvoiceDto, { posPaidAmount: sale.collected });
+    const invoiceNumber = await this.issueLocked(tx, me, await tx.invoice.findUniqueOrThrow({ where: { id: invoiceId } }));
+    await this.audit.record(
+      {
+        action: 'CREDIT_SALE_RECORDED',
+        entityType: 'Invoice',
+        entityId: invoiceId,
+        establishmentId: sale.establishmentId,
+        companyId: me.companyId,
+        userId: me.userId,
+        newValues: { ticket: sale.number, invoice: invoiceNumber, customerId: sale.customerId, total: sale.total, collected: sale.collected, credit: sale.creditAmount, outstandingBefore: decision.outstanding, limit: decision.limit, overrideId: decision.overrideId },
+      },
+      tx,
+    );
+    return { invoiceId, invoiceNumber };
   }
 
   /** Abandon d'un brouillon (jamais numéroté, jamais supprimé). */

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AuditService } from '../audit/audit.service';
 import { CostingService } from '../production/costing';
+import { SalesModule } from '../sales/sales.module';
 import { ProductionService } from '../production/production';
 import { SequenceService } from '../sequences/sequence.service';
 import { StockEngine } from '../stock/engine';
@@ -23,6 +24,8 @@ import { CustomerOrderStock } from './stock';
 // répartitions et acomptes, encaissés par la caisse du module 5 (décision D1).
 // Étape 5 : factures (FAC), avoirs (AVR) et créances calculées (D2, D3, D7).
 @Module({
+  // Vente à crédit : traitement de la créance enregistré auprès de la caisse (SalesService).
+  imports: [SalesModule],
   controllers: [CustomersController, CreditController, QuotesController, CustomerOrdersController, DeliveriesController, CustomerPaymentsController, InvoicesController],
   providers: [
     AuditService,

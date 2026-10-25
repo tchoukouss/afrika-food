@@ -164,6 +164,8 @@ export interface SaleRow {
   establishmentId: string;
   total: string;
   refundedTotal: string;
+  /** Part du ticket vendue à crédit ("0" = vente normale). */
+  creditAmount: string;
   createdAt: string;
   cashier: string | null;
   register: { id: string; code: string; name: string } | null;

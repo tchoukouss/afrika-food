@@ -167,6 +167,7 @@ export class RegistersService {
         payments: [],
         changeGiven: 0n,
         refundedTotal: 0n,
+        creditAmount: 0n,
       },
       { width: columnsFor(reg.paperWidth), test: true },
     );

@@ -33,6 +33,9 @@ import { SupplierFinancePage } from './pages/stock/SupplierFinance';
 import { TransfersPage } from './pages/stock/Transfers';
 import { ChangePasswordPage } from './pages/ChangePassword';
 import { CompanyPage } from './pages/Company';
+import { CustomerInvoicesPage } from './pages/customers/CustomerInvoices';
+import { CustomerPaymentsPage } from './pages/customers/CustomerPayments';
+import { CustomersPage } from './pages/customers/Customers';
 import { EstablishmentsPage } from './pages/Establishments';
 import { HomePage } from './pages/Home';
 import { LoginPage } from './pages/Login';
@@ -90,6 +93,9 @@ function App() {
         <Route path="cuisine" element={<KitchenPage />} />
         <Route path="reservations" element={<ReservationsPage />} />
         <Route path="restaurant-parametres" element={<RestaurantSetupPage />} />
+        <Route path="clients" element={<CustomersPage />} />
+        <Route path="factures-clients" element={<CustomerInvoicesPage />} />
+        <Route path="paiements-clients" element={<CustomerPaymentsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

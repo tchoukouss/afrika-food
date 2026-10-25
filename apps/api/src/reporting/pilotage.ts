@@ -39,7 +39,7 @@ export class PilotageService {
     return this.prisma.$queryRaw<
       {
         id: string;
-        tickets: bigint; tickets_tax: bigint; tickets_count: number;
+        tickets: bigint; tickets_tax: bigint; tickets_count: number; tickets_credit: bigint;
         cancels: bigint; cancels_tax: bigint; cancels_count: number;
         refunds: bigint; refunds_count: number;
         invoices: bigint; invoices_tax: bigint; invoices_count: number;
@@ -48,7 +48,8 @@ export class PilotageService {
     >`
       WITH e AS (SELECT unnest(${ids}::uuid[]) AS id),
       t AS (
-        SELECT establishment_id AS id, sum(total)::bigint AS ttc, sum(tax_total)::bigint AS tax, count(*)::int AS cnt
+        -- Part à crédit des tickets (vente à crédit) : comprise dans le CA du ticket, jamais encaissée en caisse.
+        SELECT establishment_id AS id, sum(total)::bigint AS ttc, sum(tax_total)::bigint AS tax, count(*)::int AS cnt, sum(credit_amount)::bigint AS credit
         FROM sales WHERE company_id = ${s.companyId}::uuid AND establishment_id = ANY(${ids}::uuid[]) AND created_at >= ${s.start} AND created_at < ${s.end}
         GROUP BY 1),
       c AS (
@@ -77,7 +78,7 @@ export class PilotageService {
         WHERE cn.company_id = ${s.companyId}::uuid AND cn.establishment_id = ANY(${ids}::uuid[]) AND cn.created_at >= ${s.start} AND cn.created_at < ${s.end}
         GROUP BY 1)
       SELECT e.id::text AS id,
-        coalesce(t.ttc, 0)::bigint AS tickets, coalesce(t.tax, 0)::bigint AS tickets_tax, coalesce(t.cnt, 0) AS tickets_count,
+        coalesce(t.ttc, 0)::bigint AS tickets, coalesce(t.tax, 0)::bigint AS tickets_tax, coalesce(t.cnt, 0) AS tickets_count, coalesce(t.credit, 0)::bigint AS tickets_credit,
         coalesce(c.ttc, 0)::bigint AS cancels, coalesce(c.tax, 0)::bigint AS cancels_tax, coalesce(c.cnt, 0) AS cancels_count,
         coalesce(r.ttc, 0)::bigint AS refunds, coalesce(r.cnt, 0) AS refunds_count,
         coalesce(i.ttc, 0)::bigint AS invoices, coalesce(i.tax, 0)::bigint AS invoices_tax, coalesce(i.cnt, 0) AS invoices_count,
@@ -91,7 +92,7 @@ export class PilotageService {
     // TVA exacte seulement si aucun remboursement de ticket (non ventilé en TVA dans le module 5).
     const tax = r.refunds === 0n ? r.tickets_tax - r.cancels_tax + r.invoices_tax - r.credits_tax : null;
     return {
-      tickets: { gross: r.tickets, count: r.tickets_count, tax: r.tickets_tax },
+      tickets: { gross: r.tickets, count: r.tickets_count, tax: r.tickets_tax, onCredit: r.tickets_credit },
       cancellations: { amount: r.cancels, count: r.cancels_count, tax: r.cancels_tax },
       refunds: { amount: r.refunds, count: r.refunds_count, tax: null },
       ticketsNet,
@@ -245,7 +246,10 @@ export class PilotageService {
     close: { receivables: bigint; advances: bigint; deposits: bigint },
   ) {
     const gap = rev.revenue - col.total;
-    const tickets = rev.ticketsNet - col.tickets;
+    // La part à crédit des tickets n'est pas encaissée : elle devient une créance (facture du ticket),
+    // déjà comprise dans la variation des créances ; elle n'est donc pas un écart d'horodatage.
+    const ticketsOnCredit = rev.tickets.onCredit;
+    const tickets = rev.ticketsNet - col.tickets - ticketsOnCredit;
     const receivablesChange = close.receivables - open.receivables;
     const advancesChange = close.advances - open.advances;
     const depositsChange = close.deposits - open.deposits;
@@ -257,6 +261,7 @@ export class PilotageService {
       gap,
       explanation: {
         ticketsTiming: tickets,
+        ticketsOnCredit,
         receivablesChange,
         advancesChange,
         advancesDetail: { deposits: depositsChange, unappliedPayments: advancesChange - depositsChange },

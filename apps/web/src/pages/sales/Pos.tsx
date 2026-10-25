@@ -2,10 +2,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Minus, Percent, Plus, Search, X } from 'lucide-react';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { CustomerPicker, useCustomerCredit } from '../../components/CustomerPicker';
 import { Alert, Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner } from '../../components/ui';
 import { api, ApiError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import type { Product } from '../../lib/catalog-types';
+import type { CreditOverride, Customer } from '../../lib/customer-types';
 import { formatXOF } from '../../lib/format';
 import { CashRegister, CashSessionDetail, REFERENCE_REQUIRED, SaleResult } from '../../lib/sales-types';
 import { PAYMENT_METHODS } from '../../lib/stock-types';
@@ -125,6 +127,7 @@ function Register({ session, establishmentId }: { session: CashSessionDetail; es
   const [editing, setEditing] = useState<{ index: number | null } | null>(null);
   const [paying, setPaying] = useState(0); // clé du formulaire de paiement (nouvel identifiant à chaque vente)
   const [done, setDone] = useState<SaleResult | null>(null);
+  const [doneCustomer, setDoneCustomer] = useState<Customer | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const add = (p: Product) =>
@@ -291,18 +294,20 @@ function Register({ session, establishmentId }: { session: CashSessionDetail; es
         <PaymentDialog
           key={paying}
           sessionId={session.id}
+          establishmentId={establishmentId}
           cart={cart}
           ticketDiscount={ticketDiscount}
           total={total}
           onClose={() => setPaying(0)}
-          onSold={(res) => {
+          onSold={(res, customer) => {
             setPaying(0);
             setDone(res);
+            setDoneCustomer(customer);
             reset();
           }}
         />
       )}
-      {done && <SaleDone result={done} onClose={() => setDone(null)} />}
+      {done && <SaleDone result={done} customer={doneCustomer} establishmentId={establishmentId} onClose={() => setDone(null)} />}
     </div>
   );
 }
@@ -352,6 +357,7 @@ interface PaymentLine {
 /** Encaissement : plusieurs moyens possibles, monnaie rendue sur les espèces uniquement (décision 11). */
 function PaymentDialog({
   sessionId,
+  establishmentId,
   cart,
   ticketDiscount,
   total,
@@ -359,21 +365,34 @@ function PaymentDialog({
   onSold,
 }: {
   sessionId: string;
+  establishmentId: string;
   cart: CartLine[];
   ticketDiscount: Discount;
   total: number;
   onClose: () => void;
-  onSold: (r: SaleResult) => void;
+  onSold: (r: SaleResult, customer: Customer | null) => void;
 }) {
   const qc = useQueryClient();
+  const { can } = useAuth();
   // Même identifiant à chaque tentative de ce formulaire : jamais deux ventes pour un double clic.
   const requestId = useRequestId();
   const [payments, setPayments] = useState<PaymentLine[]>([{ method: 'CASH', amount: String(total), reference: '' }]);
+  // Vente à crédit (module 7) : part du ticket mise en créance sur un client, jamais un moyen de paiement.
+  const [creditOn, setCreditOn] = useState(false);
+  const [customer, setCustomer] = useState<Customer | null>(null);
+  const [creditInput, setCreditInput] = useState('');
+  const [overrideId, setOverrideId] = useState('');
   const paid = payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
   const cash = payments.filter((p) => p.method === 'CASH').reduce((s, p) => s + (Number(p.amount) || 0), 0);
-  const rest = total - paid;
-  const change = Math.max(0, paid - total);
-  const update = (i: number, patch: Partial<PaymentLine>) => setPayments((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
+  const credit = creditOn ? Math.round(Number(creditInput) || 0) : 0;
+  const rest = total - paid - credit;
+  // Avec une part à crédit, encaissé + crédit = total exactement : aucune monnaie rendue.
+  const change = credit > 0 ? 0 : Math.max(0, paid - total);
+  const creditError =
+    credit <= 0 ? null : !customer ? 'Choisissez le client pour la part à crédit.' : credit > total ? 'La part à crédit dépasse le total.' : paid + credit !== total ? 'Payé + à crédit doit faire exactement le total.' : null;
+  // Le FCFA n'a pas de centimes : tout montant saisi doit être entier (jamais arrondi en silence à l'envoi).
+  const nonInteger = [...payments.map((p) => p.amount), ...(creditOn ? [creditInput] : [])].some((v) => v.trim() !== '' && !Number.isInteger(Number(v)));
+  const update =(i: number, patch: Partial<PaymentLine>) => setPayments((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
   const sale = useMutation({
     mutationFn: () =>
       api.post<SaleResult>('/sales', {
@@ -390,13 +409,16 @@ function PaymentDialog({
         payments: payments
           .filter((p) => Number(p.amount) > 0)
           .map((p) => ({ method: p.method, amount: Math.round(Number(p.amount)), ...(p.reference.trim() ? { reference: p.reference.trim() } : {}) })),
+        ...(credit > 0 && customer ? { credit: { customerId: customer.id, amount: credit, ...(overrideId ? { overrideId } : {}) } } : {}),
       }),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ['cash-sessions'] });
       qc.invalidateQueries({ queryKey: ['sales'] });
-      onSold(res);
+      if (credit > 0) qc.invalidateQueries({ queryKey: ['customer-credit'] });
+      onSold(res, credit > 0 ? customer : null);
     },
   });
+  const errorCode = (sale.error as ApiError | null)?.code;
   const quick = [...new Set([total, Math.ceil(total / 500) * 500, Math.ceil(total / 1000) * 1000, Math.ceil(total / 5000) * 5000, 10000])].filter((v) => v >= total).slice(0, 4);
   return (
     <Modal open wide title={`Encaisser ${formatXOF(total)}`} onClose={onClose}>
@@ -442,28 +464,127 @@ function PaymentDialog({
           <Button type="button" variant="ghost" onClick={() => setPayments((ps) => [...ps, { method: 'WAVE', amount: String(Math.max(0, rest)), reference: '' }])}>
             <Plus className="size-4" /> Autre moyen
           </Button>
+          {can('customers.view') && (
+            <Button
+              type="button"
+              variant={creditOn ? 'secondary' : 'ghost'}
+              onClick={() => {
+                if (creditOn) {
+                  setCreditOn(false);
+                  setOverrideId('');
+                  sale.reset(); // l'erreur d'un essai à crédit (409…) ne concerne plus la vente normale
+                  // Paiement insuffisant hors crédit (ex. après « Tout à crédit ») : retour au paiement complet en espèces.
+                  if (paid < total) setPayments([{ method: 'CASH', amount: String(total), reference: '' }]);
+                } else {
+                  setCreditOn(true);
+                  setCreditInput(String(Math.max(0, total - paid)));
+                }
+              }}
+            >
+              {creditOn ? 'Sans crédit' : 'Vente à crédit'}
+            </Button>
+          )}
         </div>
-        <div className="grid grid-cols-3 gap-2 rounded-lg bg-stone-50 p-3 text-center text-sm">
-          <div>
-            Reçu
-            <div className="text-lg font-bold">{formatXOF(paid)}</div>
+        {creditOn && (
+          <div className="space-y-2 rounded-lg border border-stone-200 p-3">
+            <CustomerPicker
+              establishmentId={establishmentId}
+              value={customer}
+              onChange={(c) => {
+                setCustomer(c);
+                setOverrideId('');
+              }}
+              amount={credit}
+            />
+            <div className="flex flex-wrap items-end gap-2">
+              <Field label="Part à crédit (FCFA)">
+                <Input
+                  className="w-36"
+                  type="number"
+                  min={0}
+                  max={total}
+                  step={1}
+                  value={creditInput}
+                  onChange={(e) => {
+                    setCreditInput(e.target.value);
+                    setOverrideId('');
+                  }}
+                />
+              </Field>
+              <Button type="button" variant="secondary" onClick={() => setCreditInput(String(Math.max(0, total - paid)))}>
+                Reste à crédit
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => {
+                  setPayments([{ method: 'CASH', amount: '0', reference: '' }]);
+                  setCreditInput(String(total));
+                }}
+              >
+                Tout à crédit
+              </Button>
+            </div>
           </div>
-          <div>
-            Reste à payer
-            <div className={`text-lg font-bold ${rest > 0 ? 'text-red-700' : ''}`}>{formatXOF(Math.max(0, rest))}</div>
+        )}
+        {creditOn ? (
+          <div className={`grid grid-cols-2 gap-2 rounded-lg bg-stone-50 p-3 text-center text-sm ${credit === 0 ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
+            <div>
+              Total
+              <div className="text-lg font-bold">{formatXOF(total)}</div>
+            </div>
+            <div>
+              Payé
+              <div className="text-lg font-bold">{formatXOF(paid)}</div>
+            </div>
+            <div>
+              À crédit
+              <div className="text-lg font-bold text-brand-700">{formatXOF(credit)}</div>
+            </div>
+            <div>
+              Reste
+              {credit === 0 ? (
+                // Sans part à crédit, mêmes règles que le paiement normal : un trop-perçu est de la monnaie.
+                <div className={`text-lg font-bold ${rest > 0 ? 'text-red-700' : 'text-green-700'}`}>{formatXOF(Math.max(0, rest))}</div>
+              ) : (
+                <div className={`text-lg font-bold ${rest !== 0 ? 'text-red-700' : 'text-green-700'}`}>{rest < 0 ? `−${formatXOF(-rest)}` : formatXOF(rest)}</div>
+              )}
+            </div>
+            {credit === 0 && (
+              <div>
+                Monnaie à rendre
+                <div className="text-lg font-bold text-green-700">{formatXOF(change)}</div>
+              </div>
+            )}
           </div>
-          <div>
-            Monnaie à rendre
-            <div className="text-lg font-bold text-green-700">{formatXOF(change)}</div>
+        ) : (
+          <div className="grid grid-cols-3 gap-2 rounded-lg bg-stone-50 p-3 text-center text-sm">
+            <div>
+              Reçu
+              <div className="text-lg font-bold">{formatXOF(paid)}</div>
+            </div>
+            <div>
+              Reste à payer
+              <div className={`text-lg font-bold ${rest > 0 ? 'text-red-700' : ''}`}>{formatXOF(Math.max(0, rest))}</div>
+            </div>
+            <div>
+              Monnaie à rendre
+              <div className="text-lg font-bold text-green-700">{formatXOF(change)}</div>
+            </div>
           </div>
-        </div>
+        )}
+        {nonInteger && <Alert>Montants en FCFA entiers uniquement (pas de centimes).</Alert>}
+        {creditError && <Alert tone="info">{creditError}</Alert>}
         {change > cash && <Alert>La monnaie ne se rend qu’en espèces : les autres moyens ne peuvent pas dépasser le total.</Alert>}
         {sale.error && <Alert>{(sale.error as ApiError).message}</Alert>}
+        {credit > 0 && customer && (errorCode === 'CREDIT_LIMIT_EXCEEDED' || errorCode === 'CREDIT_OVERRIDE_INVALID' || overrideId) && (
+          <OverrideChoice customer={customer} establishmentId={establishmentId} amount={credit} value={overrideId} onChange={setOverrideId} />
+        )}
         <div className="flex justify-end gap-2">
           <Button type="button" variant="ghost" onClick={onClose}>
             Retour
           </Button>
-          <Button type="submit" className="py-3" loading={sale.isPending} disabled={rest > 0 || change > cash}>
+          <Button type="submit" className="py-3" loading={sale.isPending} disabled={nonInteger || (credit > 0 ? !!creditError : rest > 0 || change > cash)}>
             Valider l’encaissement
           </Button>
         </div>
@@ -472,7 +593,62 @@ function PaymentDialog({
   );
 }
 
-function SaleDone({ result, onClose }: { result: SaleResult; onClose: () => void }) {
+/**
+ * Limite de crédit dépassée (409) : choix d'une pré-autorisation déjà accordée
+ * par un responsable (fiche client) pour ce client, cet établissement et ce montant.
+ * Le serveur la consomme et reste seul juge de sa validité.
+ */
+function OverrideChoice({ customer, establishmentId, amount, value, onChange }: { customer: Customer; establishmentId: string; amount: number; value: string; onChange: (id: string) => void }) {
+  const credit = useCustomerCredit(customer.id, establishmentId);
+  const list = useQuery({
+    queryKey: ['customer-credit-overrides', customer.id],
+    queryFn: () => api.get<CreditOverride[]>(`/customers/${customer.id}/credit-overrides`),
+    staleTime: 0,
+  });
+  if (list.isLoading) return <Spinner />;
+  if (list.error) return <Alert>{(list.error as ApiError).message}</Alert>;
+  const usable = (list.data ?? []).filter((o) => o.status === 'ACTIVE' && o.establishmentId === establishmentId && Number(o.maxAmount) >= amount);
+  if (usable.length === 0) {
+    const hidden = (credit.data?.activeOverrides ?? 0) > 0 && (list.data ?? []).length === 0;
+    return (
+      <Alert tone="info">
+        {hidden
+          ? 'Une autorisation de dépassement est active pour ce client, mais votre rôle ne permet pas de la consulter : un responsable doit valider cette vente.'
+          : `Aucune autorisation de dépassement active couvrant ${formatXOF(amount)} dans cet établissement. Un responsable peut en accorder une depuis la fiche client (menu Clients), puis réessayez.`}
+      </Alert>
+    );
+  }
+  return (
+    <Field label="Autorisation de dépassement">
+      <Select value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">— Choisir une autorisation —</option>
+        {usable.map((o) => (
+          <option key={o.id} value={o.id}>
+            Jusqu’à {formatXOF(o.maxAmount)} · {o.reason} · {o.approvedBy ?? '—'} · expire {new Date(o.expiresAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}
+          </option>
+        ))}
+      </Select>
+    </Field>
+  );
+}
+
+/** Facture créée par une vente à crédit : retrouvée dans les factures du client (la réponse de vente ne la contient pas). */
+function CreditInvoice({ saleId, customer, establishmentId }: { saleId: string; customer: Customer; establishmentId: string }) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['invoices', 'sale', saleId],
+    queryFn: () => api.get<{ id: string; number: string | null; saleId: string | null }[]>(`/invoices?customerId=${customer.id}&establishmentId=${establishmentId}`),
+  });
+  const invoice = data?.find((i) => i.saleId === saleId);
+  return (
+    <div className="text-sm">
+      Client : <strong>{customer.name}</strong> · Facture :{' '}
+      {isLoading ? '…' : error ? <span className="text-red-700">{(error as ApiError).message}</span> : <strong>{invoice?.number ?? 'non trouvée'}</strong>}
+    </div>
+  );
+}
+
+function SaleDone({ result, customer, establishmentId, onClose }: { result: SaleResult; customer: Customer | null; establishmentId: string; onClose: () => void }) {
+  const credit = Number(result.sale.creditAmount ?? 0);
   const [job, setJob] = useState(result.print);
   const printed = useRef(false);
   useEffect(() => {
@@ -490,11 +666,19 @@ function SaleDone({ result, onClose }: { result: SaleResult; onClose: () => void
             Total
             <div className="text-xl font-bold">{formatXOF(result.sale.total)}</div>
           </div>
-          <div className="rounded-lg bg-green-50 p-3">
-            Monnaie à rendre
-            <div className="text-xl font-bold text-green-700">{formatXOF(result.sale.changeGiven)}</div>
-          </div>
+          {credit > 0 ? (
+            <div className="rounded-lg bg-brand-50 p-3">
+              À crédit
+              <div className="text-xl font-bold text-brand-700">{formatXOF(credit)}</div>
+            </div>
+          ) : (
+            <div className="rounded-lg bg-green-50 p-3">
+              Monnaie à rendre
+              <div className="text-xl font-bold text-green-700">{formatXOF(result.sale.changeGiven)}</div>
+            </div>
+          )}
         </div>
+        {credit > 0 && customer && <CreditInvoice saleId={result.sale.id} customer={customer} establishmentId={establishmentId} />}
         <PrintStatus job={job} ticket={result.ticket} onDone={setJob} />
         <TicketPreview ticket={result.ticket} />
         <div className="flex justify-end">

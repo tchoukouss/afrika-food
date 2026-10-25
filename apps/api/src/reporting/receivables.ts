@@ -24,8 +24,9 @@ const share = (part: bigint, total: bigint) => (total > 0n ? Number((part * 1000
  * Module 8 — Pilotage, étape 2 : créances, acomptes et clients. Lecture seule ;
  * situations reconstituées à la fin de la période (et à son début pour les
  * variations) par les calculs de position communs, même formule que le module 7.
- * Factures de tickets exclues des créances (réglées à la caisse) ; tickets
- * anonymes jamais rattachés à un client ; TVA des acomptes non calculée.
+ * Factures de tickets : en créance seulement pour leur part vendue à crédit
+ * et restant due, jamais dans le CA facturé (le ticket est déjà compté) ;
+ * tickets anonymes jamais rattachés à un client ; TVA des acomptes non calculée.
  */
 @Injectable()
 export class ReceivablesKpiService {
@@ -55,13 +56,13 @@ export class ReceivablesKpiService {
                     ELSE 'OVER_90' END AS bucket,
                count(*)::int AS count, sum(total)::bigint AS billed, sum(pos_paid + allocated - cn_refunded)::bigint AS paid,
                sum(credited)::bigint AS credited, sum(balance)::bigint AS balance
-        FROM ib WHERE source <> 'SALE' AND balance > 0
+        FROM ib WHERE balance > 0
         GROUP BY 1, 2`,
       this.prisma.$queryRaw<{ id: string; count: number; billed: bigint; paid: bigint; credited: bigint; balance: bigint }[]>`
         WITH ${invoiceBalancesAt(s.companyId, s.ids, t)}
         SELECT establishment_id::text AS id, count(*)::int AS count, sum(total)::bigint AS billed, sum(pos_paid + allocated - cn_refunded)::bigint AS paid,
                sum(credited)::bigint AS credited, sum(greatest(balance, 0))::bigint AS balance
-        FROM ib WHERE source <> 'SALE' AND issued_at >= ${s.start}
+        FROM ib WHERE (source <> 'SALE' OR pos_paid < total) AND issued_at >= ${s.start}
         GROUP BY 1`,
       this.establishments(s),
     ]);
@@ -81,7 +82,7 @@ export class ReceivablesKpiService {
       period: { from: s.from, to: s.to },
       asOf: s.to,
       currency: 'XOF',
-      notes: ['Créances ouvertes à la fin du dernier jour de la période ; ancienneté selon l’échéance figée à l’émission. Factures de tickets exclues (réglées en caisse).'],
+      notes: ['Créances ouvertes à la fin du dernier jour de la période ; ancienneté selon l’échéance figée à l’émission. Factures de tickets : seulement la part vendue à crédit et restant due (un ticket réglé en caisse n’est pas une créance).'],
       total: shape(open, issued),
       byEstablishment: ests.map((e) => ({ establishment: e, ...shape(open.filter((r) => r.id === e.id), issued.filter((r) => r.id === e.id)) })),
     };
@@ -193,7 +194,7 @@ export class ReceivablesKpiService {
       WITH ${invoiceBalancesAt(s.companyId, s.ids, s.end)},
       bal AS (
         SELECT customer_id, sum(balance)::bigint AS balance, sum(CASE WHEN due_date < ${s.to}::date THEN balance ELSE 0 END)::bigint AS overdue
-        FROM ib WHERE source <> 'SALE' AND balance > 0 GROUP BY 1),
+        FROM ib WHERE balance > 0 GROUP BY 1),
       inv AS (
         SELECT customer_id, sum(total)::bigint AS v FROM invoices
         WHERE company_id = ${s.companyId}::uuid AND establishment_id = ANY(${s.ids}::uuid[]) AND number IS NOT NULL AND source <> 'SALE'
@@ -255,7 +256,7 @@ export class ReceivablesKpiService {
       this.prisma.$queryRaw<{ id: string; number: string; customer_id: string; establishment_id: string; due_date: Date; days: number; balance: bigint }[]>`
         WITH ${invoiceBalancesAt(s.companyId, s.ids, s.end)}
         SELECT id::text AS id, number, customer_id::text AS customer_id, establishment_id::text AS establishment_id, due_date, (${s.to}::date - due_date)::int AS days, balance
-        FROM ib WHERE source <> 'SALE' AND balance > 0 AND due_date < ${s.to}::date
+        FROM ib WHERE balance > 0 AND due_date < ${s.to}::date
         ORDER BY days DESC, number ASC LIMIT 100`,
     ]);
     const customers = await this.prisma.customer.findMany({

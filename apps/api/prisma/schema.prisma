@@ -1659,6 +1659,8 @@ model Sale {
   taxTotal             BigInt     @map("tax_total")
   paidTotal            BigInt     @map("paid_total")
   changeGiven          BigInt     @map("change_given")
+  // Part mise à crédit (créance du module 7) : jamais un paiement ni un mouvement de caisse.
+  creditAmount         BigInt     @default(0) @map("credit_amount")
   // Coût réel des lots vendus (marges).
   costTotal            Decimal    @map("cost_total") @db.Decimal(18, 2)
   refundedTotal        BigInt     @default(0) @map("refunded_total")
