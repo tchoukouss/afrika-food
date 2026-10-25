@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Plus, Undo2 } from 'lucide-react';
+import { ArrowLeft, Ban, Plus, Undo2, UserCheck } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { CustomerPicker } from '../../components/CustomerPicker';
 import { Alert, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Table, Td, Textarea } from '../../components/ui';
@@ -473,9 +473,124 @@ function RefundDeposit({ deposit, onClose }: { deposit: DepositDetail; onClose: 
   );
 }
 
+/**
+ * Passage en crédit client (POST /deposits/:id/credit { reason }) : l'avance n'est plus rattachée
+ * à sa commande et reste disponible pour les factures du client. Aucun mouvement de caisse ;
+ * le serveur ne l'accepte que pour un acompte « Reçu ».
+ */
+function CreditDeposit({ deposit, onClose }: { deposit: DepositDetail; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [reason, setReason] = useState('');
+  const length = reason.trim().length;
+  const error = length < 3 || length > 500 ? 'Motif obligatoire (3 à 500 caractères).' : null;
+  const credit = useMutation({
+    mutationFn: () => api.post<DepositDetail>(`/deposits/${deposit.id}/credit`, { reason: reason.trim() }),
+    onSuccess: (updated) => {
+      // La réponse est la fiche de l'acompte : elle s'affiche sans relecture.
+      qc.setQueryData(['deposits', 'detail', deposit.id], updated);
+      qc.invalidateQueries({ queryKey: ['deposits', 'list'] });
+      qc.invalidateQueries({ queryKey: ['deposits', 'receipt', deposit.id] });
+      qc.invalidateQueries({ queryKey: ['customer-credit'] });
+      if (deposit.orderId) qc.invalidateQueries({ queryKey: ['customer-orders', 'detail', deposit.orderId] });
+      onClose();
+    },
+  });
+  return (
+    <Modal open title={`Créditer le client — acompte ${deposit.number}`} onClose={() => !credit.isPending && onClose()}>
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!error && !credit.isPending) credit.mutate();
+        }}
+      >
+        <p className="text-sm">
+          <strong>{formatXOF(deposit.available)}</strong> disponibles sur cet acompte deviennent un crédit de <strong>{deposit.customer?.name}</strong>
+          {deposit.order ? `, détaché de la commande ${deposit.order.number}` : ''}. Ce crédit reste imputable sur ses factures ou remboursable ; aucun mouvement de caisse.
+        </p>
+        <Field label="Motif">
+          <Textarea rows={2} required minLength={3} maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Commande annulée, avance conservée…" />
+        </Field>
+        {error && reason && <Alert tone="info">{error}</Alert>}
+        {credit.error && <Alert>{(credit.error as ApiError).message}</Alert>}
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="ghost" disabled={credit.isPending} onClick={onClose}>
+            Retour
+          </Button>
+          <Button type="submit" loading={credit.isPending} disabled={!!error}>
+            Créditer {formatXOF(deposit.available)}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/**
+ * Annulation d'une saisie erronée (POST /deposits/:id/cancel { reason }) : les paiements qui
+ * financent l'acompte redeviennent « non répartis » ; aucun mouvement de caisse (l'argent reste
+ * encaissé, à répartir ou à annuler côté paiement). Refusée par le serveur si l'acompte est en
+ * partie remboursé ou imputé sur une facture. Pas d'identifiant d'idempotence dans le contrat.
+ */
+function CancelDeposit({ deposit, onClose }: { deposit: DepositDetail; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [reason, setReason] = useState('');
+  const length = reason.trim().length;
+  const error = length < 3 || length > 500 ? 'Motif obligatoire (3 à 500 caractères).' : null;
+  const payments = [...new Set(deposit.allocations.filter((a) => a.target === 'DEPOSIT' && !a.releasedAt).map((a) => a.payment.number))];
+  const cancel = useMutation({
+    mutationFn: () => api.post<DepositDetail>(`/deposits/${deposit.id}/cancel`, { reason: reason.trim() }),
+    onSuccess: (updated) => {
+      // La réponse est la fiche de l'acompte : elle s'affiche sans relecture.
+      qc.setQueryData(['deposits', 'detail', deposit.id], updated);
+      qc.invalidateQueries({ queryKey: ['deposits', 'list'] });
+      qc.invalidateQueries({ queryKey: ['deposits', 'receipt', deposit.id] });
+      qc.invalidateQueries({ queryKey: ['customer-payments'] });
+      qc.invalidateQueries({ queryKey: ['cash-sessions'] });
+      qc.invalidateQueries({ queryKey: ['customer-credit'] });
+      if (deposit.orderId) qc.invalidateQueries({ queryKey: ['customer-orders', 'detail', deposit.orderId] });
+      onClose();
+    },
+  });
+  return (
+    <Modal open title={`Annuler l’acompte ${deposit.number}`} onClose={() => !cancel.isPending && onClose()}>
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!error && !cancel.isPending) cancel.mutate();
+        }}
+      >
+        <p className="text-sm">
+          Annulation de l’acompte de <strong>{formatXOF(deposit.amount)}</strong> de {deposit.customer?.name} (saisie erronée). L’annulation est définitive.
+        </p>
+        <p className="text-sm text-stone-600">
+          Aucun mouvement de caisse : l’argent reste encaissé et redevient « à répartir » sur {payments.length > 1 ? 'les paiements' : 'le paiement'} {payments.join(', ') || '—'}, à répartir sur une facture ou à annuler depuis
+          « Paiements clients ».
+        </p>
+        <Field label="Motif">
+          <Textarea rows={2} required minLength={3} maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Saisie erronée…" />
+        </Field>
+        {error && reason && <Alert tone="info">{error}</Alert>}
+        {cancel.error && <Alert>{(cancel.error as ApiError).message}</Alert>}
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="ghost" disabled={cancel.isPending} onClick={onClose}>
+            Retour
+          </Button>
+          <Button type="submit" variant="danger" loading={cancel.isPending} disabled={!!error}>
+            Annuler l’acompte
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 function DepositView({ id, onBack }: { id: string; onBack: () => void }) {
   const { me } = useAuth();
   const [refunding, setRefunding] = useState(false);
+  const [crediting, setCrediting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const { data: d, isLoading, error } = useQuery({ queryKey: ['deposits', 'detail', id], queryFn: () => api.get<DepositDetail>(`/deposits/${id}`) });
   const back = (
     <Button variant="ghost" onClick={onBack}>
@@ -497,17 +612,35 @@ function DepositView({ id, onBack }: { id: string; onBack: () => void }) {
   // Remboursement : reçu ou crédit client, disponible, « Encaisser paiements et acomptes » (canManage) + « Effectuer un remboursement » dans son établissement.
   const hasHere = (perm: string) => !!me?.globalPermissions.includes(perm) || !!est?.permissions.includes(perm);
   const canRefund = REFUNDABLE.includes(d.status) && n(d.available) > 0 && d.canManage && hasHere('sales.refund');
+  // Crédit client : acompte « Reçu » seulement (règle du serveur), disponible, « Encaisser paiements et acomptes » dans son établissement.
+  const canCredit = d.status === 'RECEIVED' && n(d.available) > 0 && d.canManage && hasHere('payments.manage');
+  // Annulation : reçu ou crédit client, rien de remboursé ni d'imputé, « Encaisser paiements et acomptes » + « Annuler une vente » (règles du serveur).
+  const canCancel = REFUNDABLE.includes(d.status) && n(d.refundedAmount) === 0 && n(d.applied) === 0 && d.canManage && hasHere('sales.cancel');
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         {back}
-        {canRefund && (
-          <Button variant="secondary" onClick={() => setRefunding(true)}>
-            <Undo2 className="size-4" /> Rembourser
-          </Button>
-        )}
+        <div className="flex flex-wrap gap-2">
+          {canCredit && (
+            <Button variant="secondary" onClick={() => setCrediting(true)}>
+              <UserCheck className="size-4" /> Créditer le client
+            </Button>
+          )}
+          {canRefund && (
+            <Button variant="secondary" onClick={() => setRefunding(true)}>
+              <Undo2 className="size-4" /> Rembourser
+            </Button>
+          )}
+          {canCancel && (
+            <Button variant="danger" onClick={() => setCancelling(true)}>
+              <Ban className="size-4" /> Annuler
+            </Button>
+          )}
+        </div>
       </div>
       {refunding && <RefundDeposit deposit={d} onClose={() => setRefunding(false)} />}
+      {crediting && <CreditDeposit deposit={d} onClose={() => setCrediting(false)} />}
+      {cancelling && <CancelDeposit deposit={d} onClose={() => setCancelling(false)} />}
       <Card
         title={
           <span className="flex flex-wrap items-center gap-2">
