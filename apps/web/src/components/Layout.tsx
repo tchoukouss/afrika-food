@@ -1,4 +1,5 @@
 import {
+  AlarmClock,
   ArrowLeftRight,
   Banknote,
   BookOpen,
@@ -118,6 +119,7 @@ const NAV: { section: string; items: NavItem[] }[] = [
       { to: '/factures-clients', label: 'Facturation', icon: <FileText className="size-4" />, permission: INVOICE_READ },
       { to: '/paiements-clients', label: 'Paiements clients', icon: <Banknote className="size-4" />, permission: PAYMENT_READ },
       { to: '/acomptes-clients', label: 'Acomptes clients', icon: <PiggyBank className="size-4" />, permission: DEPOSIT_READ },
+      { to: '/creances-clients', label: 'Créances clients', icon: <AlarmClock className="size-4" />, permission: 'dashboard.view' },
     ],
   },
   {

@@ -38,6 +38,7 @@ import { DeliveriesPage } from './pages/customers/Deliveries';
 import { CustomerInvoicesPage } from './pages/customers/CustomerInvoices';
 import { CustomerOrdersPage } from './pages/customers/CustomerOrders';
 import { CustomerPaymentsPage } from './pages/customers/CustomerPayments';
+import { CustomerReceivablesPage } from './pages/customers/CustomerReceivables';
 import { CustomerQuotesPage } from './pages/customers/CustomerQuotes';
 import { CustomersPage } from './pages/customers/Customers';
 import { DashboardPage } from './pages/pilotage/Dashboard';
@@ -105,6 +106,7 @@ function App() {
         <Route path="factures-clients" element={<CustomerInvoicesPage />} />
         <Route path="paiements-clients" element={<CustomerPaymentsPage />} />
         <Route path="acomptes-clients" element={<CustomerDepositsPage />} />
+        <Route path="creances-clients" element={<CustomerReceivablesPage />} />
         <Route path="pilotage/dashboard" element={<DashboardPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
