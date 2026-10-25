@@ -227,6 +227,96 @@ describe('Module 7 — Étape 4 : paiements clients, répartitions et acomptes',
     });
   });
 
+  describe('Reçus de paiement', () => {
+    const receipt = (u: Session, id: string, est = plateau) => api(app, u, est).get(`/api/customer-payments/${id}/receipt`);
+
+    it('imprime un paiement en caisse, sans exposer la session ni les mouvements', async () => {
+      const r = (await receipt(cashier, ids.cashPayment).expect(200)).body;
+      expect([r.title, r.number, r.status, r.cancelled, r.method, r.methodLabel, r.reference, r.register, num(r.amount)]).toEqual([
+        'Reçu de paiement',
+        `PLT-PAY-${year}-000001`,
+        'RECORDED',
+        null,
+        'CASH',
+        'Espèces',
+        null,
+        'En caisse',
+        20000,
+      ]);
+      expect([r.customer.name, r.customer.phone, r.establishment.code, r.establishment.name, r.company.name, typeof r.receivedBy]).toEqual([
+        'Famille Kouassi',
+        '0708090807',
+        'PLT',
+        'Pâtisserie Plateau',
+        'AFRIKA FOOD Test',
+        'string',
+      ]);
+      expect(Object.keys(r.establishment).sort()).toEqual(['address', 'city', 'code', 'name', 'phone', 'receiptFooter', 'receiptHeader']);
+      expect(Object.keys(r.company).sort()).toEqual(['legalName', 'name', 'taxId']);
+      for (const key of ['sessionId', 'cashMovementId', 'reversalMovementId', 'provider']) expect(r).not.toHaveProperty(key);
+      expect(r.mention).toBe('Reçu de paiement. Ce reçu ne vaut pas facture.');
+    });
+
+    it('détaille les répartitions actives sur facture et acompte, avec le reste au crédit du client', async () => {
+      const p = (await pay(accountant, { method: 'CHEQUE', amount: 10000, reference: 'CHQ-RECU' }).expect(201)).body;
+      const inv = (
+        await api(app, manager, plateau)
+          .post('/api/invoices')
+          .send({ establishmentId: plateau, source: 'MANUAL', customerId: ids.customer, lines: [{ kind: 'FEE', label: 'Location de salle', quantity: 1, unitPrice: 4000 }] })
+          .expect(201)
+      ).body;
+      const issued = (await api(app, manager, plateau).post(`/api/invoices/${inv.id}/issue`).expect(201)).body;
+      await api(app, manager, plateau).post(`/api/invoices/${inv.id}/allocations`).send({ paymentId: p.id, amount: 4000 }).expect(201);
+      const d = (await deposit(manager, { funding: [{ paymentId: p.id, amount: 3000 }] }).expect(201)).body;
+      const detail = (await api(app, manager, plateau).get(`/api/customer-payments/${p.id}`).expect(200)).body;
+
+      const r = (await receipt(accountant, p.id).expect(200)).body;
+      expect([r.method, r.methodLabel, r.reference, r.register]).toEqual(['CHEQUE', 'Chèque', 'CHQ-RECU', 'Hors caisse']);
+      expect(r.allocations.map((a: { target: string; number: string; amount: string }) => [a.target, a.number, num(a.amount)])).toEqual([
+        ['INVOICE', issued.number, 4000],
+        ['DEPOSIT', d.number, 3000],
+      ]);
+      expect([num(r.allocated), num(r.unallocated)]).toEqual([num(detail.allocated), num(detail.unallocated)]);
+      expect([num(r.allocated), num(r.unallocated)]).toEqual([7000, 3000]);
+      expect(r.mention).toMatch(/^Reçu de paiement\. Ce reçu ne vaut pas facture\. /);
+      expect(r.mention).toMatch(/3000 FCFA.*crédit du client/);
+    });
+
+    it('exclut les répartitions libérées', async () => {
+      // Virement : 30 000 libérés par l'annulation d'un acompte, 20 000 toujours affectés.
+      const released = await prisma.paymentAllocation.count({ where: { paymentId: ids.transfer, releasedAt: { not: null } } });
+      expect(released).toBeGreaterThan(0);
+      const r = (await receipt(accountant, ids.transfer).expect(200)).body;
+      const active = await prisma.paymentAllocation.findMany({ where: { paymentId: ids.transfer, releasedAt: null } });
+      expect(r.allocations).toHaveLength(active.length);
+      expect(r.allocations.reduce((s: number, a: { amount: string }) => s + num(a.amount), 0)).toBe(num(r.allocated));
+      expect([num(r.allocated), num(r.unallocated)]).toEqual([20000, 30000]);
+    });
+
+    it('imprime un paiement annulé avec son annulation', async () => {
+      const r = (await receipt(manager, ids.cardPayment).expect(200)).body;
+      expect([r.status, r.cancelled.reason, typeof r.cancelled.by, !!r.cancelled.at, num(r.unallocated), r.allocations]).toEqual(['CANCELLED', 'Erreur de montant', 'string', true, 0, []]);
+      expect(r.mention).toBe('Reçu de paiement. Ce reçu ne vaut pas facture.');
+    });
+
+    it('applique les droits de lecture et l’isolation des établissements', async () => {
+      await receipt(waiter, ids.cashPayment).expect(404); // aucun droit de lecture des paiements
+      await receipt(managerYop, ids.cashPayment, yopougon).expect(404); // autre établissement
+      await receipt(manager, randomUUID()).expect(404);
+      await receipt(manager, 'pas-un-uuid').expect(400);
+      await receipt(accountant, ids.cashPayment).expect(200);
+    });
+
+    it('reste une lecture pure : aucune écriture, aucun audit, aucun mouvement de caisse', async () => {
+      const counts = () =>
+        Promise.all([prisma.auditLog.count(), prisma.cashMovement.count(), prisma.paymentAllocation.count(), prisma.customerPayment.count(), prisma.customerPayment.findUniqueOrThrow({ where: { id: ids.cashPayment } })]);
+      const before = await counts();
+      await receipt(manager, ids.cashPayment).expect(200);
+      await receipt(manager, ids.transfer).expect(200);
+      expect(await counts()).toEqual(before);
+    });
+  });
+
   describe('Droits et isolation', () => {
     it('limite paiements et acomptes à l’établissement et aux droits', async () => {
       await api(app, managerYop, yopougon).get(`/api/customer-payments/${ids.cashPayment}`).expect(404);

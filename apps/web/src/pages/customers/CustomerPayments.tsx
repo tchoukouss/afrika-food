@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Ban, Plus, Split } from 'lucide-react';
+import { ArrowLeft, Ban, Plus, Printer, Split } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { CustomerPicker } from '../../components/CustomerPicker';
 import { Alert, Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Table, Td, Textarea } from '../../components/ui';
@@ -10,6 +10,7 @@ import { formatDateTime, formatXOF } from '../../lib/format';
 import { CUSTOMER_PAYMENT_STATUS, CustomerPaymentDetail, CustomerPaymentRow, INVOICE_LIST_LIMIT, INVOICE_STATUS, InvoiceDetail, InvoiceRow, PAYMENT_READ } from '../../lib/invoice-types';
 import { CashSessionDetail, REFERENCE_REQUIRED } from '../../lib/sales-types';
 import { PAYMENT_METHODS } from '../../lib/stock-types';
+import { printLines } from '../sales/Ticket';
 import { RequirePermission, StatusBadge, useReasonDialog, useRequestId } from '../stock/shared';
 
 const n = (v: string | number) => Number(v);
@@ -420,11 +421,124 @@ function AllocatePayment({ payment, onClose }: { payment: CustomerPaymentDetail;
   );
 }
 
+/** GET /customer-payments/:id/receipt : données d'impression du reçu (montants FCFA en chaînes). */
+interface PaymentReceipt {
+  title: string;
+  number: string;
+  date: string;
+  status: string;
+  cancelled: { at: string | null; by: string | null; reason: string | null } | null;
+  company: { name: string; legalName: string | null; taxId: string | null };
+  establishment: { code: string; name: string; address: string | null; city: string | null; phone: string | null; receiptHeader: string | null; receiptFooter: string | null };
+  customer: { id: string; name: string; phone: string | null } | null;
+  amount: string;
+  method: string;
+  methodLabel: string;
+  reference: string | null;
+  register: string;
+  allocations: { target: 'INVOICE' | 'DEPOSIT'; number: string | null; amount: string }[];
+  allocated: string;
+  unallocated: string;
+  receivedBy: string | null;
+  mention: string;
+}
+
+/** Largeur du reçu en caractères (papier 80 mm, comme les reçus d'acompte et les tickets de caisse). */
+const RECEIPT_WIDTH = 42;
+
+/** Mise en page texte du reçu de paiement à partir des seules données du serveur. */
+function receiptLines(r: PaymentReceipt): string[] {
+  const W = RECEIPT_WIDTH;
+  const out: string[] = [];
+  // Les montants formatés contiennent des espaces insécables : remplacés pour un alignement fixe.
+  const money = (v: string) => formatXOF(v).replace(/\s/g, ' ');
+  const wrap = (text: string) => {
+    let line = '';
+    for (const w of text.split(/\s+/).filter(Boolean)) {
+      if (line && line.length + 1 + w.length > W) {
+        out.push(line);
+        line = w;
+      } else line = line ? `${line} ${w}` : w;
+    }
+    if (line) out.push(line);
+  };
+  const center = (text: string) => (text.length >= W ? wrap(text) : out.push(' '.repeat(Math.floor((W - text.length) / 2)) + text));
+  const pair = (label: string, value: string) => {
+    if (label.length + value.length + 1 > W) {
+      wrap(label);
+      out.push(value.padStart(W));
+    } else out.push(label + value.padStart(W - label.length));
+  };
+  const rule = (c = '-') => out.push(c.repeat(W));
+
+  center(r.company.name.toUpperCase());
+  if (r.company.legalName && r.company.legalName !== r.company.name) center(r.company.legalName);
+  center(r.establishment.name);
+  const address = [r.establishment.address, r.establishment.city].filter(Boolean).join(', ');
+  if (address) center(address);
+  if (r.establishment.phone) center(`Tél. ${r.establishment.phone}`);
+  if (r.company.taxId) center(`N° CC ${r.company.taxId}`);
+  r.establishment.receiptHeader?.split('\n').forEach((l) => l.trim() && center(l.trim()));
+  rule('=');
+  center(r.title.toUpperCase());
+  center(`N° ${r.number}`);
+  center(formatDateTime(r.date));
+  if (r.status === 'CANCELLED') {
+    rule('*');
+    center('*** ANNULÉ ***');
+    if (r.cancelled?.at) pair('Annulé le :', formatDateTime(r.cancelled.at));
+    if (r.cancelled?.by) pair('Par :', r.cancelled.by);
+    if (r.cancelled?.reason) wrap(`Motif : ${r.cancelled.reason}`);
+    rule('*');
+  }
+  rule();
+  pair('Client :', r.customer?.name ?? '—');
+  if (r.customer?.phone) pair('Tél. :', r.customer.phone);
+  rule();
+  pair('MONTANT', money(r.amount));
+  pair('Moyen :', r.methodLabel);
+  if (r.reference) pair('Réf. :', r.reference);
+  pair('Caisse :', r.register);
+  if (r.allocations.length) {
+    rule();
+    out.push('Répartition :');
+    for (const a of r.allocations) pair(`${a.target === 'INVOICE' ? 'Facture' : 'Acompte'} ${a.number ?? '—'}`, money(a.amount));
+  }
+  rule();
+  pair('Total réparti :', money(r.allocated));
+  if (n(r.unallocated) > 0) pair('Non réparti :', money(r.unallocated));
+  rule();
+  if (r.receivedBy) pair('Encaissé par :', r.receivedBy);
+  out.push('');
+  wrap(r.mention);
+  if (r.establishment.receiptFooter?.trim()) {
+    out.push('');
+    r.establishment.receiptFooter.split('\n').forEach((l) => l.trim() && center(l.trim()));
+  }
+  return out;
+}
+
 function PaymentView({ id, onBack }: { id: string; onBack: () => void }) {
   const { me } = useAuth();
   const qc = useQueryClient();
   const reason = useReasonDialog();
   const [allocating, setAllocating] = useState(false);
+  // Reçu : lu sur le serveur au moment du clic (GET /customer-payments/:id/receipt), puis imprimé par le navigateur.
+  const [printing, setPrinting] = useState(false);
+  const [printError, setPrintError] = useState<string | null>(null);
+  const printReceipt = async () => {
+    if (printing) return;
+    setPrinting(true);
+    setPrintError(null);
+    try {
+      const r = await api.get<PaymentReceipt>(`/customer-payments/${id}/receipt`);
+      printLines(receiptLines(r), RECEIPT_WIDTH, `${r.title} ${r.number}`);
+    } catch (e) {
+      setPrintError(e instanceof ApiError ? `Impression impossible : ${e.message}` : 'Impression impossible : le reçu n’a pas pu être préparé.');
+    } finally {
+      setPrinting(false);
+    }
+  };
   const { data: p, isLoading, error } = useQuery({ queryKey: ['customer-payments', 'detail', id], queryFn: () => api.get<CustomerPaymentDetail>(`/customer-payments/${id}`) });
   // Annulation (correction d'une erreur d'encaissement) : le serveur passe le mouvement inverse dans la session d'origine et renvoie le paiement à jour.
   const cancel = useMutation({
@@ -460,6 +574,9 @@ function PaymentView({ id, onBack }: { id: string; onBack: () => void }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         {back}
         <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" loading={printing} disabled={printing} onClick={printReceipt}>
+            <Printer className="size-4" /> Imprimer le reçu
+          </Button>
           {canAllocate && (
             <Button onClick={() => setAllocating(true)} disabled={cancel.isPending}>
               <Split className="size-4" /> Répartir
@@ -473,6 +590,7 @@ function PaymentView({ id, onBack }: { id: string; onBack: () => void }) {
         </div>
       </div>
       {cancel.error && <Alert>{(cancel.error as ApiError).message}</Alert>}
+      {printError && <Alert>{printError}</Alert>}
       {reason.dialog}
       {allocating && <AllocatePayment payment={p} onClose={() => setAllocating(false)} />}
       <Card

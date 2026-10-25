@@ -153,6 +153,46 @@ export class CustomerPaymentsService {
     };
   }
 
+  /**
+   * Reçu de paiement : données d'impression (lecture seule, sans écriture ni audit). Même contrôle
+   * d'accès que la fiche ; un paiement annulé reste imprimable, avec son annulation.
+   */
+  async paymentReceipt(me: AuthUser, id: string) {
+    const p = await this.getPayment(me, id);
+    const [company, est] = await Promise.all([
+      this.prisma.company.findUniqueOrThrow({ where: { id: me.companyId }, select: { name: true, legalName: true, taxId: true } }),
+      this.prisma.establishment.findUniqueOrThrow({
+        where: { id: p.establishmentId },
+        select: { code: true, name: true, address: true, city: true, phone: true, receiptHeader: true, receiptFooter: true },
+      }),
+    ]);
+    const mention = ['Reçu de paiement. Ce reçu ne vaut pas facture.'];
+    if (p.unallocated > 0n) mention.push(`Montant non réparti (${p.unallocated} FCFA) : il reste au crédit du client.`);
+    return {
+      title: 'Reçu de paiement',
+      number: p.number,
+      date: p.createdAt,
+      status: p.status,
+      cancelled: p.status === 'CANCELLED' ? { at: p.cancelledAt, by: p.cancelledBy, reason: p.cancelReason } : null,
+      company,
+      establishment: est,
+      customer: p.customer,
+      amount: p.amount,
+      method: p.method,
+      methodLabel: p.methodLabel,
+      reference: p.reference,
+      // Session et mouvements de caisse jamais exposés : seulement « en caisse » ou « hors caisse ».
+      register: p.sessionId ? 'En caisse' : 'Hors caisse',
+      allocations: p.allocations
+        .filter((a) => !a.releasedAt)
+        .map((a) => ({ target: a.target, number: a.target === 'INVOICE' ? a.invoice?.number ?? null : a.deposit?.number ?? null, amount: a.amount })),
+      allocated: p.allocated,
+      unallocated: p.unallocated,
+      receivedBy: p.createdBy,
+      mention: mention.join(' '),
+    };
+  }
+
   async listDeposits(me: AuthUser, q: DepositQuery) {
     return this.prisma.deposit.findMany({
       where: { companyId: me.companyId, establishmentId: { in: this.readable(me, q.establishmentId) }, customerId: q.customerId, orderId: q.orderId, status: q.status },
@@ -531,6 +571,11 @@ export class CustomerPaymentsController {
   @Get('customer-payments/:id')
   getPayment(@CurrentUser() me: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
     return this.service.getPayment(me, id);
+  }
+
+  @Get('customer-payments/:id/receipt')
+  paymentReceipt(@CurrentUser() me: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.service.paymentReceipt(me, id);
   }
 
   @Post('customer-payments')
