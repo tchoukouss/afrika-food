@@ -46,6 +46,10 @@ export class CancelDeliveryDto {
   @Transform(trim) @IsString() @MinLength(3) @MaxLength(500) reason: string;
 }
 
+class DriversQuery {
+  @IsUUID() establishmentId: string;
+}
+
 class DeliveryQuery {
   @IsOptional() @IsUUID() establishmentId?: string;
   @IsOptional() @IsEnum(DeliveryStatus) status?: DeliveryStatus;
@@ -137,6 +141,21 @@ export class DeliveriesService {
       },
     });
     if (!ok) throw new BadRequestException('Livreur invalide : il doit avoir « Gérer les livraisons » dans cet établissement');
+  }
+
+  /** Livreurs affectables dans un établissement : même filtre que checkDriver, sans rôles ni permissions exposés. */
+  async drivers(me: AuthUser, establishmentId: string) {
+    if (!this.isManager(me, establishmentId)) throw new ForbiddenException("Vous n'avez pas cette permission pour cet établissement");
+    return this.prisma.user.findMany({
+      where: {
+        companyId: me.companyId,
+        isActive: true,
+        deletedAt: null,
+        userRoles: { some: { OR: [{ establishmentId }, { establishmentId: null }], role: { deletedAt: null, permissions: { some: { permissionCode: DRIVER } } } } },
+      },
+      select: { id: true, fullName: true, phone: true },
+      orderBy: { fullName: 'asc' },
+    });
   }
 
   // --- Création et modification -------------------------------------------------------------
@@ -302,6 +321,13 @@ export class DeliveriesController {
   @Get('deliveries')
   list(@CurrentUser() me: AuthUser, @Query() q: DeliveryQuery) {
     return this.service.list(me, q);
+  }
+
+  @Get('deliveries/drivers')
+  @RequirePermissions(WRITE)
+  @AnyEstablishmentScope()
+  drivers(@CurrentUser() me: AuthUser, @Query() q: DriversQuery) {
+    return this.service.drivers(me, q.establishmentId);
   }
 
   @Get('deliveries/:id')

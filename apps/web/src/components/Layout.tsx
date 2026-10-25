@@ -12,6 +12,7 @@ import {
   Contact,
   Croissant,
   Factory,
+  FileSignature,
   FileText,
   Gauge,
   GitBranch,
@@ -22,6 +23,7 @@ import {
   LogOut,
   Menu,
   MonitorSmartphone,
+  PiggyBank,
   Receipt,
   ReceiptText,
   ScrollText,
@@ -40,7 +42,10 @@ import {
 import { ReactNode, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
+import { DEPOSIT_READ } from '../lib/deposit-types';
 import { INVOICE_READ, PAYMENT_READ } from '../lib/invoice-types';
+import { CUSTOMER_ORDER_READ } from '../lib/order-types';
+import { QUOTE_READ } from '../lib/quote-types';
 
 interface NavItem {
   to: string;
@@ -105,8 +110,11 @@ const NAV: { section: string; items: NavItem[] }[] = [
     section: 'Clients',
     items: [
       { to: '/clients', label: 'Clients', icon: <Contact className="size-4" />, permission: 'customers.view' },
+      { to: '/devis-clients', label: 'Devis clients', icon: <FileSignature className="size-4" />, permission: QUOTE_READ },
+      { to: '/commandes-clients', label: 'Commandes clients', icon: <ClipboardList className="size-4" />, permission: CUSTOMER_ORDER_READ },
       { to: '/factures-clients', label: 'Facturation', icon: <FileText className="size-4" />, permission: INVOICE_READ },
       { to: '/paiements-clients', label: 'Paiements clients', icon: <Banknote className="size-4" />, permission: PAYMENT_READ },
+      { to: '/acomptes-clients', label: 'Acomptes clients', icon: <PiggyBank className="size-4" />, permission: DEPOSIT_READ },
     ],
   },
   {

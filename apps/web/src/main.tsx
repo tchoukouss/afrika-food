@@ -33,8 +33,11 @@ import { SupplierFinancePage } from './pages/stock/SupplierFinance';
 import { TransfersPage } from './pages/stock/Transfers';
 import { ChangePasswordPage } from './pages/ChangePassword';
 import { CompanyPage } from './pages/Company';
+import { CustomerDepositsPage } from './pages/customers/CustomerDeposits';
 import { CustomerInvoicesPage } from './pages/customers/CustomerInvoices';
+import { CustomerOrdersPage } from './pages/customers/CustomerOrders';
 import { CustomerPaymentsPage } from './pages/customers/CustomerPayments';
+import { CustomerQuotesPage } from './pages/customers/CustomerQuotes';
 import { CustomersPage } from './pages/customers/Customers';
 import { DashboardPage } from './pages/pilotage/Dashboard';
 import { EstablishmentsPage } from './pages/Establishments';
@@ -95,8 +98,11 @@ function App() {
         <Route path="reservations" element={<ReservationsPage />} />
         <Route path="restaurant-parametres" element={<RestaurantSetupPage />} />
         <Route path="clients" element={<CustomersPage />} />
+        <Route path="devis-clients" element={<CustomerQuotesPage />} />
+        <Route path="commandes-clients" element={<CustomerOrdersPage />} />
         <Route path="factures-clients" element={<CustomerInvoicesPage />} />
         <Route path="paiements-clients" element={<CustomerPaymentsPage />} />
+        <Route path="acomptes-clients" element={<CustomerDepositsPage />} />
         <Route path="pilotage/dashboard" element={<DashboardPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

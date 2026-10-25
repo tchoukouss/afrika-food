@@ -1,5 +1,5 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, FileMinus, Wallet } from 'lucide-react';
+import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { ArrowLeft, FileMinus, PiggyBank, Send, Wallet } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CustomerPicker } from '../../components/CustomerPicker';
@@ -8,6 +8,7 @@ import { api, ApiError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { qty } from '../../lib/catalog-types';
 import type { Customer } from '../../lib/customer-types';
+import { DEPOSIT_STATUS, DepositDetail, DepositRow } from '../../lib/deposit-types';
 import { formatDate, formatDateTime, formatXOF } from '../../lib/format';
 import {
   INVOICE_LIST_LIMIT,
@@ -259,6 +260,122 @@ function PayInvoice({ inv, onClose }: { inv: InvoiceDetail; onClose: () => void 
           </Button>
           <Button type="submit" loading={pay.isPending} disabled={!!amountError || (!offRegister && !sessionOk)}>
             Encaisser {amountError ? '' : formatXOF(amount)}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/** Acomptes encore utilisables (règle du serveur) : reçus ou conservés en crédit client. */
+const DEPOSIT_USABLE = ['RECEIVED', 'CUSTOMER_CREDIT'];
+
+/**
+ * Imputation d'un acompte sur la facture (POST /invoices/:id/allocations { depositId, amount }) :
+ * l'argent déjà reçu passe de l'acompte à la facture, sans mouvement de caisse. Acomptes du même
+ * client et du même établissement ; le disponible vient de la fiche de chaque acompte (la liste
+ * ne le renvoie pas). Le contrat n'a pas d'identifiant d'idempotence : l'envoi est bloqué pendant l'appel.
+ */
+function ApplyDeposit({ inv, onClose, onApplied }: { inv: InvoiceDetail; onClose: () => void; onApplied: (r: { deposit: string; amount: number; balance: string }) => void }) {
+  const qc = useQueryClient();
+  const due = Math.max(0, n(inv.balance));
+  const list = useQuery({
+    queryKey: ['deposits', 'list', 'invoice', inv.customerId, inv.establishmentId],
+    queryFn: () => api.get<DepositRow[]>(`/deposits?customerId=${inv.customerId}&establishmentId=${inv.establishmentId}`),
+    retry: false,
+  });
+  const candidates = (list.data ?? []).filter((d) => d.customerId === inv.customerId && d.establishmentId === inv.establishmentId && DEPOSIT_USABLE.includes(d.status));
+  const details = useQueries({
+    queries: candidates.map((d) => ({ queryKey: ['deposits', 'detail', d.id], queryFn: () => api.get<DepositDetail>(`/deposits/${d.id}`) })),
+  });
+  const loadingDetails = details.some((q) => q.isLoading);
+  const usable = details.map((q) => q.data).filter((d): d is DepositDetail => !!d && n(d.available) > 0);
+  const [depositId, setDepositId] = useState('');
+  const [amountText, setAmountText] = useState('');
+  const chosen = usable.find((d) => d.id === depositId);
+  const max = chosen ? Math.min(n(chosen.available), due) : 0;
+  const amount = Number(amountText);
+  const amountError = !chosen
+    ? 'Choisissez l’acompte.'
+    : amountText.trim() === '' || !Number.isInteger(amount)
+      ? 'Montant en FCFA entier.'
+      : amount <= 0
+        ? 'Le montant doit être positif.'
+        : amount > n(chosen.available)
+          ? `L’acompte ${chosen.number} n’a que ${formatXOF(chosen.available)} disponibles.`
+          : amount > due
+            ? `Le montant ne peut pas dépasser le reste dû (${formatXOF(due)}).`
+            : null;
+  const apply = useMutation({
+    mutationFn: () => api.post<InvoiceDetail>(`/invoices/${inv.id}/allocations`, { depositId, amount }),
+    onSuccess: (updated) => {
+      // La réponse est la fiche de la facture : elle s'affiche sans relecture.
+      qc.setQueryData(['invoices', 'detail', inv.id], updated);
+      qc.invalidateQueries({ queryKey: ['invoices', 'list'] });
+      qc.invalidateQueries({ queryKey: ['deposits'] });
+      qc.invalidateQueries({ queryKey: ['customer-payments'] });
+      qc.invalidateQueries({ queryKey: ['customer-credit'] });
+      onApplied({ deposit: chosen!.number, amount, balance: updated.balance });
+    },
+  });
+  return (
+    <Modal open title={`Imputer un acompte — facture ${inv.number}`} onClose={() => !apply.isPending && onClose()}>
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!amountError && !apply.isPending) apply.mutate();
+        }}
+      >
+        <div className="text-sm">
+          {inv.customer?.name} · reste dû <strong>{formatXOF(due)}</strong>
+        </div>
+        {list.isLoading || loadingDetails ? (
+          <Spinner />
+        ) : list.error ? (
+          <Alert>{(list.error as ApiError).message}</Alert>
+        ) : usable.length === 0 ? (
+          <Alert tone="info">Aucun acompte disponible pour ce client dans l’établissement de la facture.</Alert>
+        ) : (
+          <Table head={['', 'Acompte', 'Montant', 'Imputé', 'Remboursé', 'Disponible', 'Statut']}>
+            {usable.map((d) => (
+              <tr
+                key={d.id}
+                className="cursor-pointer hover:bg-stone-50"
+                onClick={() => {
+                  setDepositId(d.id);
+                  setAmountText(String(Math.min(n(d.available), due)));
+                }}
+              >
+                <Td>
+                  <input type="radio" name="deposit" checked={depositId === d.id} readOnly aria-label={`Acompte ${d.number}`} />
+                </Td>
+                <Td className="font-mono text-xs font-semibold">{d.number}</Td>
+                <Td className="whitespace-nowrap">{formatXOF(d.amount)}</Td>
+                <Td className="whitespace-nowrap">{formatXOF(d.applied)}</Td>
+                <Td className="whitespace-nowrap">{formatXOF(d.refundedAmount)}</Td>
+                <Td className="whitespace-nowrap font-semibold">{formatXOF(d.available)}</Td>
+                <Td>
+                  <StatusBadge map={DEPOSIT_STATUS} status={d.status} />
+                </Td>
+              </tr>
+            ))}
+          </Table>
+        )}
+        {chosen && (
+          <Field label={`Montant à imputer (FCFA), ${formatXOF(max)} au plus`}>
+            <Input type="number" min={1} max={max} step={1} required value={amountText} onChange={(e) => setAmountText(e.target.value)} />
+          </Field>
+        )}
+        <p className="text-xs text-stone-500">Argent déjà encaissé : aucun mouvement de caisse. Le reste dû de la facture diminue du montant imputé.</p>
+        {amountError && chosen && amountText.trim() !== '' && <Alert tone="info">{amountError}</Alert>}
+        {apply.error && <Alert>{(apply.error as ApiError).message}</Alert>}
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="ghost" disabled={apply.isPending} onClick={onClose}>
+            Retour
+          </Button>
+          <Button type="submit" loading={apply.isPending} disabled={!!amountError}>
+            Imputer {amountError ? '' : formatXOF(amount)}
           </Button>
         </div>
       </form>
@@ -569,7 +686,22 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
   const [paying, setPaying] = useState(false);
   const [crediting, setCrediting] = useState(false);
   const [lastCreditNote, setLastCreditNote] = useState<CreatedCreditNote | null>(null);
+  const [applying, setApplying] = useState(false);
+  const [lastApplied, setLastApplied] = useState<{ deposit: string; amount: number; balance: string } | null>(null);
   const { data: inv, isLoading, error } = useQuery({ queryKey: ['invoices', 'detail', id], queryFn: () => api.get<InvoiceDetail>(`/invoices/${id}`) });
+  // Émission : numéro FAC et échéance attribués par le serveur, facture figée ; la réponse est la fiche à jour.
+  const qc = useQueryClient();
+  const [issuing, setIssuing] = useState(false);
+  const issue = useMutation({
+    mutationFn: () => api.post<InvoiceDetail>(`/invoices/${id}/issue`),
+    onSuccess: (updated) => {
+      qc.setQueryData(['invoices', 'detail', id], updated);
+      qc.invalidateQueries({ queryKey: ['invoices', 'list'] });
+      qc.invalidateQueries({ queryKey: ['customer-credit'] });
+      if (updated.orderId) qc.invalidateQueries({ queryKey: ['customer-orders', 'detail', updated.orderId] });
+      setIssuing(false);
+    },
+  });
   const back = (
     <Button variant="ghost" onClick={onBack}>
       <ArrowLeft className="size-4" /> Retour à la liste
@@ -583,6 +715,8 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
         <Alert>{(error as ApiError | null)?.message ?? 'Facture introuvable'}</Alert>
       </div>
     );
+  // Émission : brouillon, « Émettre / annuler des factures » dans son établissement (canManage, calculé par le serveur).
+  const canIssue = inv.status === 'DRAFT' && inv.canManage;
   const est = me?.establishments.find((e) => e.id === inv.establishmentId);
   const origin = inv.source === 'ORDER' && inv.order ? `${INVOICE_SOURCES.ORDER} ${inv.order.number}` : inv.source === 'SALE' && inv.sale ? `Ticket ${inv.sale.number} (vente à crédit)` : INVOICE_SOURCES[inv.source];
   const activeAllocations = inv.allocations.filter((a) => !a.releasedAt);
@@ -598,9 +732,19 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         {back}
         <div className="flex flex-wrap gap-2">
+          {canIssue && (
+            <Button disabled={issue.isPending} onClick={() => setIssuing(true)}>
+              <Send className="size-4" /> Émettre la facture
+            </Button>
+          )}
           {canCredit && (
             <Button variant="secondary" onClick={() => setCrediting(true)}>
               <FileMinus className="size-4" /> Créer un avoir
+            </Button>
+          )}
+          {canPay && (
+            <Button variant="secondary" onClick={() => setApplying(true)}>
+              <PiggyBank className="size-4" /> Imputer un acompte
             </Button>
           )}
           {canPay && (
@@ -610,6 +754,43 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
           )}
         </div>
       </div>
+      {issue.data && (
+        <Alert tone="success">
+          Facture émise : <strong>{issue.data.number}</strong>, échéance le {formatDate(issue.data.dueDate)}.
+        </Alert>
+      )}
+      <Modal open={issuing} title="Émettre la facture" onClose={() => !issue.isPending && setIssuing(false)}>
+        <div className="space-y-3 text-sm">
+          <p>
+            Facture de <strong>{inv.customer?.name}</strong> pour <strong>{formatXOF(inv.total)}</strong>.
+          </p>
+          <p>À l’émission, un numéro FAC est attribué et l’échéance calculée selon les conditions du client. La facture est alors figée : elle ne se corrige plus que par un avoir.</p>
+          {issue.error && <Alert>{(issue.error as ApiError).message}</Alert>}
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" disabled={issue.isPending} onClick={() => setIssuing(false)}>
+              Retour
+            </Button>
+            <Button loading={issue.isPending} onClick={() => !issue.isPending && issue.mutate()}>
+              Émettre la facture
+            </Button>
+          </div>
+        </div>
+      </Modal>
+      {lastApplied && (
+        <Alert tone="success">
+          Acompte <strong>{lastApplied.deposit}</strong> imputé : {formatXOF(lastApplied.amount)}. Nouveau reste dû : <strong>{formatXOF(Math.max(0, n(lastApplied.balance)))}</strong>.
+        </Alert>
+      )}
+      {applying && (
+        <ApplyDeposit
+          inv={inv}
+          onClose={() => setApplying(false)}
+          onApplied={(r) => {
+            setApplying(false);
+            setLastApplied(r);
+          }}
+        />
+      )}
       {lastCreditNote && (
         <Alert tone="success">
           Avoir <strong>{lastCreditNote.number}</strong> créé : {formatXOF(lastCreditNote.total)} ({formatXOF(lastCreditNote.reducedDue)} déduits du reste dû
