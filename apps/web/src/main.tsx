@@ -34,6 +34,7 @@ import { TransfersPage } from './pages/stock/Transfers';
 import { ChangePasswordPage } from './pages/ChangePassword';
 import { CompanyPage } from './pages/Company';
 import { CustomerDepositsPage } from './pages/customers/CustomerDeposits';
+import { DeliveriesPage } from './pages/customers/Deliveries';
 import { CustomerInvoicesPage } from './pages/customers/CustomerInvoices';
 import { CustomerOrdersPage } from './pages/customers/CustomerOrders';
 import { CustomerPaymentsPage } from './pages/customers/CustomerPayments';
@@ -100,6 +101,7 @@ function App() {
         <Route path="clients" element={<CustomersPage />} />
         <Route path="devis-clients" element={<CustomerQuotesPage />} />
         <Route path="commandes-clients" element={<CustomerOrdersPage />} />
+        <Route path="livraisons" element={<DeliveriesPage />} />
         <Route path="factures-clients" element={<CustomerInvoicesPage />} />
         <Route path="paiements-clients" element={<CustomerPaymentsPage />} />
         <Route path="acomptes-clients" element={<CustomerDepositsPage />} />
