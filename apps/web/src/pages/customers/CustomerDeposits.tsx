@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Ban, Plus, Undo2, UserCheck } from 'lucide-react';
+import { ArrowLeft, Ban, Plus, Printer, Undo2, UserCheck } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { CustomerPicker } from '../../components/CustomerPicker';
 import { Alert, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Table, Td, Textarea } from '../../components/ui';
@@ -11,6 +11,7 @@ import { formatDateTime, formatXOF } from '../../lib/format';
 import { CUSTOMER_ORDER_STATUS, CustomerOrderRow } from '../../lib/order-types';
 import { CashSessionDetail, REFERENCE_REQUIRED } from '../../lib/sales-types';
 import { PAYMENT_METHODS } from '../../lib/stock-types';
+import { printLines } from '../sales/Ticket';
 import { RequirePermission, StatusBadge, useRequestId } from '../stock/shared';
 
 const n = (v: string | number) => Number(v);
@@ -744,15 +745,107 @@ function DepositView({ id, onBack }: { id: string; onBack: () => void }) {
   );
 }
 
-/** Données du reçu ACP (GET /deposits/:id/receipt), affichées telles que renvoyées ; pas d'impression ici. */
+/** Largeur du reçu en caractères (papier 80 mm, comme les tickets de caisse). */
+const RECEIPT_WIDTH = 42;
+
+/** Mise en page texte du reçu ACP à partir des seules données du serveur (GET /deposits/:id/receipt). */
+function receiptLines(r: DepositReceipt): string[] {
+  const W = RECEIPT_WIDTH;
+  const out: string[] = [];
+  // Les montants formatés contiennent des espaces insécables : remplacés pour un alignement fixe.
+  const money = (v: string) => formatXOF(v).replace(/\s/g, ' ');
+  const wrap = (text: string) => {
+    const words = text.split(/\s+/).filter(Boolean);
+    let line = '';
+    for (const w of words) {
+      if (line && line.length + 1 + w.length > W) {
+        out.push(line);
+        line = w;
+      } else line = line ? `${line} ${w}` : w;
+    }
+    if (line) out.push(line);
+  };
+  const center = (text: string) => (text.length >= W ? wrap(text) : out.push(' '.repeat(Math.floor((W - text.length) / 2)) + text));
+  const pair = (label: string, value: string) => {
+    if (label.length + value.length + 1 > W) {
+      wrap(label);
+      out.push(value.padStart(W));
+    } else out.push(label + value.padStart(W - label.length));
+  };
+  const rule = (c = '-') => out.push(c.repeat(W));
+
+  center(r.company.toUpperCase());
+  center(r.establishment.name);
+  if (r.establishment.address) center(r.establishment.address);
+  if (r.establishment.phone) center(`Tél. ${r.establishment.phone}`);
+  rule('=');
+  center(r.title.toUpperCase());
+  center(`N° ${r.number}`);
+  center(formatDateTime(r.date));
+  rule();
+  pair('Client :', r.customer?.name ?? '—');
+  if (r.customer?.phone) pair('Tél. :', r.customer.phone);
+  if (r.order) {
+    pair('Commande :', r.order.number);
+    pair('Total commande :', money(r.order.total));
+  }
+  rule();
+  pair('MONTANT DE L’ACOMPTE', money(r.amount));
+  if (r.payments.length) {
+    out.push('');
+    out.push('Règlement :');
+    for (const p of r.payments) {
+      pair(`${p.number} ${p.method}`, money(p.amount));
+      if (p.reference) wrap(`  Réf. ${p.reference}`);
+    }
+  }
+  if (n(r.refundedAmount) > 0 || n(r.applied) > 0) {
+    rule();
+    if (n(r.refundedAmount) > 0) pair('Remboursé :', money(r.refundedAmount));
+    if (n(r.applied) > 0) pair('Imputé sur factures :', money(r.applied));
+  }
+  rule();
+  if (r.receivedBy) pair('Encaissé par :', r.receivedBy);
+  out.push('');
+  wrap(r.mention);
+  return out;
+}
+
+/** Données du reçu ACP (GET /deposits/:id/receipt), affichées telles que renvoyées, et impression par le navigateur. */
 function DepositReceiptCard({ id }: { id: string }) {
-  const { data: r, isLoading, error } = useQuery({
+  const { data: r, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['deposits', 'receipt', id],
     queryFn: () => api.get<DepositReceipt>(`/deposits/${id}/receipt`),
     retry: false,
   });
+  const [printError, setPrintError] = useState<string | null>(null);
+  // Impression : données relues sur le serveur au moment du clic, puis mise en page texte.
+  const print = async () => {
+    setPrintError(null);
+    try {
+      const res = await refetch();
+      if (res.error || !res.data) throw res.error ?? new Error();
+      printLines(receiptLines(res.data), RECEIPT_WIDTH, `${res.data.title} ${res.data.number}`);
+    } catch (e) {
+      setPrintError(e instanceof ApiError ? `Impression impossible : ${e.message}` : 'Impression impossible : le reçu n’a pas pu être préparé.');
+    }
+  };
   return (
-    <Card title="Reçu d’acompte">
+    <Card
+      title="Reçu d’acompte"
+      actions={
+        r && (
+          <Button variant="secondary" loading={isFetching} disabled={isFetching} onClick={print}>
+            <Printer className="size-4" /> Imprimer le reçu
+          </Button>
+        )
+      }
+    >
+      {printError && (
+        <div className="mb-2">
+          <Alert>{printError}</Alert>
+        </div>
+      )}
       {isLoading ? (
         <Spinner />
       ) : error || !r ? (
