@@ -36,6 +36,7 @@ import { CompanyPage } from './pages/Company';
 import { CustomerInvoicesPage } from './pages/customers/CustomerInvoices';
 import { CustomerPaymentsPage } from './pages/customers/CustomerPayments';
 import { CustomersPage } from './pages/customers/Customers';
+import { DashboardPage } from './pages/pilotage/Dashboard';
 import { EstablishmentsPage } from './pages/Establishments';
 import { HomePage } from './pages/Home';
 import { LoginPage } from './pages/Login';
@@ -96,6 +97,7 @@ function App() {
         <Route path="clients" element={<CustomersPage />} />
         <Route path="factures-clients" element={<CustomerInvoicesPage />} />
         <Route path="paiements-clients" element={<CustomerPaymentsPage />} />
+        <Route path="pilotage/dashboard" element={<DashboardPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

@@ -13,6 +13,7 @@ import {
   Croissant,
   Factory,
   FileText,
+  Gauge,
   GitBranch,
   Home,
   KeyRound,
@@ -107,6 +108,10 @@ const NAV: { section: string; items: NavItem[] }[] = [
       { to: '/factures-clients', label: 'Facturation', icon: <FileText className="size-4" />, permission: INVOICE_READ },
       { to: '/paiements-clients', label: 'Paiements clients', icon: <Banknote className="size-4" />, permission: PAYMENT_READ },
     ],
+  },
+  {
+    section: 'Pilotage',
+    items: [{ to: '/pilotage/dashboard', label: 'Tableau de bord', icon: <Gauge className="size-4" />, permission: 'dashboard.view' }],
   },
   {
     section: 'Administration',
