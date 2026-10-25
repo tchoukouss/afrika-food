@@ -1,5 +1,5 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, FileMinus, PiggyBank, Send, Wallet } from 'lucide-react';
+import { ArrowLeft, Ban, FileMinus, PiggyBank, Send, Wallet } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CustomerPicker } from '../../components/CustomerPicker';
@@ -702,6 +702,20 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
       setIssuing(false);
     },
   });
+  // Abandon d'un brouillon (POST /invoices/:id/cancel { reason }) : jamais numéroté ni supprimé ; la commande redevient facturable.
+  const [abandoning, setAbandoning] = useState(false);
+  const [abandonReason, setAbandonReason] = useState('');
+  const abandonLength = abandonReason.trim().length;
+  const abandonError = abandonLength < 3 || abandonLength > 500 ? 'Motif obligatoire (3 à 500 caractères).' : null;
+  const abandon = useMutation({
+    mutationFn: () => api.post<InvoiceDetail>(`/invoices/${id}/cancel`, { reason: abandonReason.trim() }),
+    onSuccess: (updated) => {
+      qc.setQueryData(['invoices', 'detail', id], updated);
+      qc.invalidateQueries({ queryKey: ['invoices', 'list'] });
+      if (updated.orderId) qc.invalidateQueries({ queryKey: ['customer-orders', 'detail', updated.orderId] });
+      setAbandoning(false);
+    },
+  });
   const back = (
     <Button variant="ghost" onClick={onBack}>
       <ArrowLeft className="size-4" /> Retour à la liste
@@ -733,6 +747,19 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
         {back}
         <div className="flex flex-wrap gap-2">
           {canIssue && (
+            <Button
+              variant="danger"
+              disabled={issue.isPending || abandon.isPending}
+              onClick={() => {
+                setAbandonReason('');
+                abandon.reset();
+                setAbandoning(true);
+              }}
+            >
+              <Ban className="size-4" /> Abandonner le brouillon
+            </Button>
+          )}
+          {canIssue && (
             <Button disabled={issue.isPending} onClick={() => setIssuing(true)}>
               <Send className="size-4" /> Émettre la facture
             </Button>
@@ -759,6 +786,34 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
           Facture émise : <strong>{issue.data.number}</strong>, échéance le {formatDate(issue.data.dueDate)}.
         </Alert>
       )}
+      <Modal open={abandoning} title="Abandonner le brouillon de facture" onClose={() => !abandon.isPending && setAbandoning(false)}>
+        <form
+          className="space-y-3 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!abandonError && !abandon.isPending) abandon.mutate();
+          }}
+        >
+          <p>
+            Brouillon de <strong>{inv.customer?.name}</strong> pour <strong>{formatXOF(inv.total)}</strong>
+            {inv.order ? `, commande ${inv.order.number}` : ''}. Il est conservé comme « annulé », sans numéro FAC (aucun numéro consommé)
+            {inv.order ? ' ; la commande pourra être facturée à nouveau' : ''}.
+          </p>
+          <Field label="Motif">
+            <Textarea rows={2} required minLength={3} maxLength={500} value={abandonReason} onChange={(e) => setAbandonReason(e.target.value)} placeholder="Facture créée par erreur…" />
+          </Field>
+          {abandonError && abandonReason && <Alert tone="info">{abandonError}</Alert>}
+          {abandon.error && <Alert>{(abandon.error as ApiError).message}</Alert>}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" disabled={abandon.isPending} onClick={() => setAbandoning(false)}>
+              Retour
+            </Button>
+            <Button type="submit" variant="danger" loading={abandon.isPending} disabled={!!abandonError}>
+              Abandonner le brouillon
+            </Button>
+          </div>
+        </form>
+      </Modal>
       <Modal open={issuing} title="Émettre la facture" onClose={() => !issue.isPending && setIssuing(false)}>
         <div className="space-y-3 text-sm">
           <p>
@@ -815,7 +870,7 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
       <Card
         title={
           <span className="flex flex-wrap items-center gap-2">
-            Facture {inv.number ?? '(brouillon, sans numéro)'} <InvoiceBadges status={inv.status} paymentStatus={inv.paymentStatus} overdue={inv.overdue} />
+            {inv.number ? `Facture ${inv.number}` : inv.status === 'CANCELLED' ? 'Facture annulée (sans numéro)' : 'Facture (brouillon, sans numéro)'} <InvoiceBadges status={inv.status} paymentStatus={inv.paymentStatus} overdue={inv.overdue} />
           </span>
         }
       >
