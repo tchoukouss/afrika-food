@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Ban, CheckCircle2, FileText, HandHelping, Pencil, Plus, Trash2, Truck } from 'lucide-react';
+import { ArrowLeft, Ban, CheckCircle2, Factory, FileText, HandHelping, Pencil, Plus, Trash2, Truck } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CustomerPicker } from '../../components/CustomerPicker';
@@ -10,6 +10,7 @@ import { Product, qty } from '../../lib/catalog-types';
 import type { Customer } from '../../lib/customer-types';
 import { formatDate, formatDateTime, formatXOF } from '../../lib/format';
 import { INVOICE_PAYMENT_STATUS, INVOICE_STATUS, InvoiceDetail, InvoiceRow } from '../../lib/invoice-types';
+import { PRODUCTION_STATUS, ProductionStatus } from '../../lib/production-types';
 import {
   CUSTOMER_DOCUMENT_KINDS,
   CUSTOMER_ORDER_LIST_LIMIT,
@@ -31,6 +32,8 @@ const CANCELLABLE = ['DRAFT', 'CONFIRMED', 'IN_PREPARATION', 'READY'];
 const INVOICEABLE_ORDER = ['CONFIRMED', 'IN_PREPARATION', 'READY', 'DELIVERED', 'COMPLETED'];
 /** Facture « en cours » : une seule par commande (règle du serveur). */
 const INVOICE_IN_PROGRESS = ['DRAFT', 'ISSUED', 'DISPUTED'];
+/** Statuts de commande où la fabrication à la demande se lance (règle du serveur). */
+const PRODUCTION_ORDER_STATUSES = ['CONFIRMED', 'IN_PREPARATION'];
 /** Livraisons actives : elles bloquent la remise directe et une seconde livraison (règle du serveur). */
 const ACTIVE_DELIVERY = ['TO_PREPARE', 'READY', 'OUT'];
 const DRIVER = 'deliveries.manage';
@@ -873,6 +876,18 @@ function OrderView({ id, onBack, onEdit }: { id: string; onBack: () => void; onE
       setInvoicing(false);
     },
   });
+  // Fabrication à la demande : ordre de production du module 4 créé et rattaché à la ligne par le serveur
+  // (POST /customer-orders/:id/lines/:lineId/production, sans contenu ; idempotent par ligne côté serveur).
+  const [launched, setLaunched] = useState<{ line: string; number: string; status: ProductionStatus } | null>(null);
+  const launch = useMutation({
+    mutationFn: (line: { id: string; label: string }) => api.post<{ id: string; number: string; status: ProductionStatus }>(`/customer-orders/${id}/lines/${line.id}/production`),
+    onSuccess: (production, line) => {
+      setLaunched({ line: line.label, number: production.number, status: production.status });
+      qc.invalidateQueries({ queryKey: ['customer-orders', 'detail', id] });
+      qc.invalidateQueries({ queryKey: ['production'] });
+      qc.invalidateQueries({ queryKey: ['stock'] });
+    },
+  });
   const back = (
     <Button variant="ghost" onClick={onBack}>
       <ArrowLeft className="size-4" /> Retour à la liste
@@ -891,6 +906,8 @@ function OrderView({ id, onBack, onEdit }: { id: string; onBack: () => void; onE
   // Facturable : commande confirmée et non annulée, aucune facture en cours (brouillon, émise, en litige), « Émettre / annuler des factures ».
   const canInvoice =
     INVOICEABLE_ORDER.includes(o.status) && !!invoices.data && !invoices.data.some((i) => INVOICE_IN_PROGRESS.includes(i.status)) && hasHere('invoices.manage');
+  // Lancement : commande confirmée ou en préparation, « Gérer les commandes clients » + « Gérer la production » dans l'établissement (règles du serveur).
+  const canLaunch = PRODUCTION_ORDER_STATUSES.includes(o.status) && o.canManage && hasHere('production.manage');
   const reserved = (l: CustomerOrderDetail['lines'][number]) => l.reservations.reduce((s, r) => s + n(r.quantity), 0);
   const depositsAvailable = o.deposits.reduce((s, d) => s + n(d.amount) - n(d.refundedAmount), 0);
   // Modification : brouillon seulement, droit « Gérer les commandes clients » (canManage, calculé par le serveur).
@@ -1066,6 +1083,18 @@ function OrderView({ id, onBack, onEdit }: { id: string; onBack: () => void; onE
       )}
 
       <Card title="Lignes">
+        {launched && (
+          <div className="mb-3">
+            <Alert tone="success">
+              Fabrication lancée pour « {launched.line} » : ordre de production <strong>{launched.number}</strong> ({PRODUCTION_STATUS[launched.status]?.label.toLowerCase() ?? launched.status}), à suivre dans « Ordres de production ».
+            </Alert>
+          </div>
+        )}
+        {launch.error && (
+          <div className="mb-3">
+            <Alert>Fabrication non lancée : {(launch.error as ApiError).message}</Alert>
+          </div>
+        )}
         <Table head={['Désignation', 'Qté', 'Prix TTC', 'TVA', 'Total TTC', 'Réservé', 'Livré']} empty={o.lines.length === 0}>
           {o.lines.map((l) => (
             <tr key={l.id}>
@@ -1073,6 +1102,17 @@ function OrderView({ id, onBack, onEdit }: { id: string; onBack: () => void; onE
                 {l.label} {l.kind === 'FEE' && <Badge>Frais</Badge>} {l.madeToOrder && <Badge tone="orange">Fabriqué à la demande</Badge>}
                 {l.productCode && <div className="font-mono text-xs text-stone-500">{l.productCode}</div>}
                 {l.madeToOrder && <div className="text-xs text-stone-500">{l.productionOrderId ? 'Ordre de production lancé' : 'Production non lancée'}</div>}
+                {l.madeToOrder && !l.productionOrderId && canLaunch && l.productId && (
+                  <Button
+                    variant="secondary"
+                    className="mt-1 px-2 py-1 text-xs"
+                    loading={launch.isPending && launch.variables?.id === l.id}
+                    disabled={launch.isPending}
+                    onClick={() => !launch.isPending && launch.mutate({ id: l.id, label: l.label })}
+                  >
+                    <Factory className="size-3.5" /> Lancer la fabrication
+                  </Button>
+                )}
                 {l.note && <div className="text-xs text-stone-500">{l.note}</div>}
               </Td>
               <Td>{qty(l.quantity)}</Td>
