@@ -46,7 +46,7 @@ interface DriverOption {
 
 /**
  * Création d'une livraison (POST /customer-orders/:id/deliveries) : aucune sortie de stock,
- * la livraison réussie la fera. Livreur non proposé : aucune route ne liste les livreurs possibles.
+ * la livraison réussie la fera. Livreur affecté ensuite sur la livraison (liste : GET /deliveries/drivers).
  */
 function DeliveryForm({ order, onClose }: { order: CustomerOrderDetail; onClose: () => void }) {
   const qc = useQueryClient();

@@ -1,5 +1,5 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Ban, FileMinus, PiggyBank, Send, Wallet } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Ban, CheckCircle2, FileMinus, PiggyBank, Printer, Send, Wallet } from 'lucide-react';
 import { ReactNode, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CustomerPicker } from '../../components/CustomerPicker';
@@ -24,6 +24,7 @@ import {
 } from '../../lib/invoice-types';
 import { CashSessionDetail, REFERENCE_REQUIRED } from '../../lib/sales-types';
 import { PAYMENT_METHODS } from '../../lib/stock-types';
+import { printLines } from '../sales/Ticket';
 import { RequirePermission, StatusBadge, useRequestId } from '../stock/shared';
 
 /** Virement et chèque : enregistrés hors caisse ; tous les autres moyens passent par la session de caisse ouverte de l'encaisseur (règle du serveur). */
@@ -385,6 +386,139 @@ function ApplyDeposit({ inv, onClose, onApplied }: { inv: InvoiceDetail; onClose
 
 /** Réponse de POST /invoices/:id/credit-notes : l'avoir créé (et non la facture). */
 type CreatedCreditNote = CreditNoteSummary & { invoice: { id: string; number: string | null } };
+/** GET /credit-notes/:id : même forme (avoir, lignes, remboursements, facture d'origine). */
+type CreditNoteDetail = CreatedCreditNote;
+
+/** Largeur d'impression en caractères (papier 80 mm, comme les reçus et les tickets de caisse). */
+const PRINT_WIDTH = 42;
+/** En-tête d'impression : société et établissement de la session (GET /auth/me). */
+interface PrintHeader {
+  company: string;
+  establishment: string | null;
+}
+
+/** Outils de mise en page texte à largeur fixe. */
+function textLayout() {
+  const W = PRINT_WIDTH;
+  const out: string[] = [];
+  // Les montants formatés contiennent des espaces insécables : remplacés pour un alignement fixe.
+  const money = (v: string | number) => formatXOF(v).replace(/\s/g, ' ');
+  const wrap = (text: string) => {
+    let line = '';
+    for (const w of text.split(/\s+/).filter(Boolean)) {
+      if (line && line.length + 1 + w.length > W) {
+        out.push(line);
+        line = w;
+      } else line = line ? `${line} ${w}` : w;
+    }
+    if (line) out.push(line);
+  };
+  const center = (text: string) => (text.length >= W ? wrap(text) : out.push(' '.repeat(Math.floor((W - text.length) / 2)) + text));
+  const pair = (label: string, value: string) => {
+    if (label.length + value.length + 1 > W) {
+      wrap(label);
+      out.push(value.padStart(W));
+    } else out.push(label + value.padStart(W - label.length));
+  };
+  const rule = (c = '-') => out.push(c.repeat(W));
+  const header = (h: PrintHeader) => {
+    center(h.company.toUpperCase());
+    if (h.establishment) center(h.establishment);
+    rule('=');
+  };
+  const banner = (title: string, details: [string, string | null | undefined][], reason?: string | null) => {
+    rule('*');
+    center(`*** ${title} ***`);
+    for (const [label, value] of details) if (value) pair(label, value);
+    if (reason) wrap(`Motif : ${reason}`);
+    rule('*');
+  };
+  return { out, money, wrap, center, pair, rule, header, banner };
+}
+
+/** Facture imprimée à partir des seules données de GET /invoices/:id. */
+function invoicePrintLines(inv: InvoiceDetail, h: PrintHeader): string[] {
+  const { out, money, wrap, center, pair, rule, header, banner } = textLayout();
+  header(h);
+  center(inv.status === 'DRAFT' ? 'FACTURE (BROUILLON)' : 'FACTURE');
+  if (inv.number) center(`N° ${inv.number}`);
+  if (inv.status === 'DRAFT') banner('BROUILLON — NON ÉMISE', [['Créée le :', formatDateTime(inv.createdAt)]]);
+  if (inv.status === 'CANCELLED') banner('ANNULÉE', [['Annulée le :', inv.cancelledAt && formatDateTime(inv.cancelledAt)], ['Par :', inv.cancelledBy]], inv.cancelReason);
+  if (inv.status === 'DISPUTED') banner('EN LITIGE', [['Depuis le :', inv.disputedAt && formatDateTime(inv.disputedAt)]], inv.disputeReason);
+  rule();
+  if (inv.issuedAt) pair('Émise le :', formatDateTime(inv.issuedAt));
+  if (inv.dueDate) pair('Échéance :', `${formatDate(inv.dueDate)}${inv.paymentTermDays === 0 ? ' (comptant)' : ''}`);
+  if (inv.order) pair('Commande :', inv.order.number);
+  if (inv.sale) pair('Ticket :', inv.sale.number);
+  rule();
+  pair('Client :', inv.customer?.name ?? '—');
+  if (inv.customer?.phone) pair('Tél. :', inv.customer.phone);
+  if (inv.customer?.address) wrap(`Adresse : ${inv.customer.address}`);
+  if (inv.customer?.taxId) pair('N° CC :', inv.customer.taxId);
+  rule();
+  for (const l of inv.lines) {
+    wrap(l.label);
+    pair(`  ${qty(l.quantity)} x ${money(l.unitPrice)}${n(l.taxRate) > 0 ? ` (TVA ${qty(l.taxRate)} %)` : ''}`, money(l.lineTotal));
+    if (n(l.credited) > 0) pair('  Corrigé par avoir', `-${money(l.credited)}`);
+  }
+  rule();
+  pair('TOTAL TTC', money(inv.total));
+  if (n(inv.taxTotal) > 0) pair('dont TVA', money(inv.taxTotal));
+  if (inv.status === 'ISSUED' || inv.status === 'DISPUTED') {
+    if (n(inv.credited) > 0) pair('Avoirs :', `-${money(inv.credited)}`);
+    pair('Payé :', money(inv.paid));
+    pair(n(inv.balance) < 0 ? 'Trop-perçu :' : 'RESTE DÛ :', money(Math.abs(n(inv.balance))));
+    if (inv.paymentStatus) pair('État :', INVOICE_PAYMENT_STATUS[inv.paymentStatus].label + (inv.overdue ? ' — en retard' : ''));
+  }
+  const allocations = inv.allocations.filter((a) => !a.releasedAt);
+  if (allocations.length) {
+    rule();
+    out.push('Règlements :');
+    for (const a of allocations) pair(`${formatDate(a.createdAt)} ${a.deposit ? `Acompte ${a.deposit.number}` : a.methodLabel}`, money(a.amount));
+  }
+  if (inv.creditNotes.length) {
+    rule();
+    out.push('Avoirs :');
+    for (const c of inv.creditNotes) pair(`${formatDate(c.createdAt)} ${c.number}`, `-${money(c.total)}`);
+  }
+  if (inv.notes) {
+    rule();
+    wrap(inv.notes);
+  }
+  rule();
+  if (inv.issuedBy) pair('Émise par :', inv.issuedBy);
+  return out;
+}
+
+/** Avoir imprimé à partir de GET /credit-notes/:id (client : fiche de la facture d'origine). */
+function creditNotePrintLines(cn: CreditNoteDetail, inv: InvoiceDetail, h: PrintHeader): string[] {
+  const { out, money, wrap, center, pair, rule, header } = textLayout();
+  header(h);
+  center('AVOIR');
+  center(`N° ${cn.number}`);
+  center(formatDateTime(cn.createdAt));
+  rule();
+  pair('Sur facture :', cn.invoice.number ?? '—');
+  pair('Client :', inv.customer?.name ?? '—');
+  if (inv.customer?.phone) pair('Tél. :', inv.customer.phone);
+  if (inv.customer?.taxId) pair('N° CC :', inv.customer.taxId);
+  rule();
+  wrap(`Motif : ${cn.reason}`);
+  rule();
+  for (const l of cn.lines) {
+    wrap(l.label);
+    pair(`  ${l.quantity !== null ? `${qty(l.quantity)} unité(s)` : 'Montant'}${n(l.taxRate) > 0 ? ` (TVA ${qty(l.taxRate)} %)` : ''}`, `-${money(l.amount)}`);
+  }
+  rule();
+  pair('TOTAL AVOIR TTC', `-${money(cn.total)}`);
+  if (n(cn.taxTotal) > 0) pair('dont TVA', money(cn.taxTotal));
+  rule();
+  pair('Déduit du reste dû :', money(cn.reducedDue));
+  if (n(cn.customerCredit) > 0) pair('Crédit client :', money(cn.customerCredit));
+  if (n(cn.refundAmount) > 0) pair('Remboursé :', money(cn.refundAmount));
+  for (const r of cn.refunds) pair(`  ${PAYMENT_METHODS[r.method] ?? r.method}${r.reference ? ` ${r.reference}` : ''}`, money(r.amount));
+  return out;
+}
 
 const EXCESS_NO_RIGHT = 'Excédent : son règlement exige le droit « Encaisser paiements et acomptes » (crédit client), et « Effectuer un remboursement » pour un remboursement, dans l’établissement de la facture.';
 const EXCESS_CHOOSE = 'Choisissez le règlement de l’excédent.';
@@ -393,9 +527,9 @@ const REFUND_METHODS = ['CASH', 'ORANGE_MONEY', 'MTN_MONEY', 'MOOV_MONEY', 'WAVE
 
 /**
  * Avoir sur une facture ouverte (POST /invoices/:id/credit-notes). La part au-delà
- * du reste dû (facture déjà payée) se règle ici en crédit client : le serveur libère
- * des répartitions de la facture, l'argent redevient une avance du client.
- * Le remboursement n'est pas encore proposé.
+ * du reste dû (facture déjà payée) se règle ici en crédit client (le serveur libère
+ * des répartitions de la facture, l'argent redevient une avance du client) ou en
+ * remboursement (virement et chèque hors caisse, autres moyens par la session de caisse).
  */
 function CreateCreditNote({
   inv,
@@ -716,6 +850,49 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
       setAbandoning(false);
     },
   });
+  // Litige (POST /invoices/:id/dispute ou /resolve-dispute, { reason } obligatoire) : émise ⇄ en litige, la réponse est la fiche à jour.
+  const [disputeMode, setDisputeMode] = useState<'open' | 'resolve' | null>(null);
+  const [disputeText, setDisputeText] = useState('');
+  const disputeLength = disputeText.trim().length;
+  const disputeError = disputeLength < 3 || disputeLength > 500 ? 'Motif obligatoire (3 à 500 caractères).' : null;
+  const dispute = useMutation({
+    mutationFn: (mode: 'open' | 'resolve') => api.post<InvoiceDetail>(`/invoices/${id}/${mode === 'open' ? 'dispute' : 'resolve-dispute'}`, { reason: disputeText.trim() }),
+    onSuccess: (updated) => {
+      qc.setQueryData(['invoices', 'detail', id], updated);
+      qc.invalidateQueries({ queryKey: ['invoices', 'list'] });
+      if (updated.orderId) qc.invalidateQueries({ queryKey: ['customer-orders', 'detail', updated.orderId] });
+      setDisputeMode(null);
+    },
+  });
+  const openDispute = (mode: 'open' | 'resolve') => {
+    setDisputeText('');
+    dispute.reset();
+    setDisputeMode(mode);
+  };
+  // Impression : lecture seule, un GET au clic (GET /invoices/:id ou /credit-notes/:id), puis impression par le navigateur.
+  // L'avoir reprend le client de la fiche facture déjà chargée.
+  const [printing, setPrinting] = useState<string | null>(null);
+  const [printError, setPrintError] = useState<string | null>(null);
+  const print = async (creditNoteId?: string) => {
+    if (printing || !me || !inv) return;
+    setPrinting(creditNoteId ?? 'invoice');
+    setPrintError(null);
+    const place = me.establishments.find((e) => e.id === inv.establishmentId);
+    const h: PrintHeader = { company: me.company.name, establishment: place ? `${place.code} — ${place.name}` : null };
+    try {
+      if (creditNoteId) {
+        const cn = await api.get<CreditNoteDetail>(`/credit-notes/${creditNoteId}`);
+        printLines(creditNotePrintLines(cn, inv, h), PRINT_WIDTH, `Avoir ${cn.number}`);
+      } else {
+        const fresh = await api.get<InvoiceDetail>(`/invoices/${id}`);
+        printLines(invoicePrintLines(fresh, h), PRINT_WIDTH, fresh.number ? `Facture ${fresh.number}` : 'Facture brouillon');
+      }
+    } catch (e) {
+      setPrintError(e instanceof ApiError ? `Impression impossible : ${e.message}` : 'Impression impossible : le document n’a pas pu être préparé.');
+    } finally {
+      setPrinting(null);
+    }
+  };
   const back = (
     <Button variant="ghost" onClick={onBack}>
       <ArrowLeft className="size-4" /> Retour à la liste
@@ -740,12 +917,18 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
   const canPay = (inv.status === 'ISSUED' || inv.status === 'DISPUTED') && n(inv.balance) > 0 && canPayHere;
   // Avoir : facture émise ou en litige, montant encore corrigeable, « Émettre / annuler des factures » (canManage, calculé par le serveur).
   const canCredit = (inv.status === 'ISSUED' || inv.status === 'DISPUTED') && n(inv.correctable) > 0 && inv.canManage;
+  // Litige : émise → en litige, en litige → émise, « Émettre / annuler des factures » (canManage, calculé par le serveur).
+  const canDispute = inv.status === 'ISSUED' && inv.canManage;
+  const canResolve = inv.status === 'DISPUTED' && inv.canManage;
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         {back}
         <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" loading={printing === 'invoice'} disabled={!!printing} onClick={() => print()}>
+            <Printer className="size-4" /> Imprimer
+          </Button>
           {canIssue && (
             <Button
               variant="danger"
@@ -762,6 +945,16 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
           {canIssue && (
             <Button disabled={issue.isPending} onClick={() => setIssuing(true)}>
               <Send className="size-4" /> Émettre la facture
+            </Button>
+          )}
+          {canDispute && (
+            <Button variant="secondary" disabled={dispute.isPending} onClick={() => openDispute('open')}>
+              <AlertTriangle className="size-4" /> Mettre en litige
+            </Button>
+          )}
+          {canResolve && (
+            <Button variant="secondary" disabled={dispute.isPending} onClick={() => openDispute('resolve')}>
+              <CheckCircle2 className="size-4" /> Lever le litige
             </Button>
           )}
           {canCredit && (
@@ -781,6 +974,7 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
           )}
         </div>
       </div>
+      {printError && <Alert>{printError}</Alert>}
       {issue.data && (
         <Alert tone="success">
           Facture émise : <strong>{issue.data.number}</strong>, échéance le {formatDate(issue.data.dueDate)}.
@@ -810,6 +1004,63 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
             </Button>
             <Button type="submit" variant="danger" loading={abandon.isPending} disabled={!!abandonError}>
               Abandonner le brouillon
+            </Button>
+          </div>
+        </form>
+      </Modal>
+      {dispute.data && !disputeMode && (
+        <Alert tone="success">
+          {dispute.data.status === 'DISPUTED' ? (
+            <>
+              Facture <strong>{dispute.data.number}</strong> mise en litige.
+            </>
+          ) : (
+            <>
+              Litige levé : la facture <strong>{dispute.data.number}</strong> est de nouveau émise.
+            </>
+          )}
+        </Alert>
+      )}
+      <Modal
+        open={disputeMode !== null}
+        title={disputeMode === 'resolve' ? `Lever le litige — facture ${inv.number}` : `Mettre en litige — facture ${inv.number}`}
+        onClose={() => !dispute.isPending && setDisputeMode(null)}
+      >
+        <form
+          className="space-y-3 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (disputeMode && !disputeError && !dispute.isPending) dispute.mutate(disputeMode);
+          }}
+        >
+          {disputeMode === 'resolve' ? (
+            <p>
+              Litige ouvert le {formatDateTime(inv.disputedAt)} : {inv.disputeReason}. La facture redevient « émise ».
+            </p>
+          ) : (
+            <p>
+              Facture de <strong>{inv.customer?.name}</strong> pour <strong>{formatXOF(inv.total)}</strong>. Elle passe « en litige » : elle reste due et peut toujours être encaissée ou corrigée par un avoir.
+            </p>
+          )}
+          <Field label="Motif">
+            <Textarea
+              rows={2}
+              required
+              minLength={3}
+              maxLength={500}
+              value={disputeText}
+              onChange={(e) => setDisputeText(e.target.value)}
+              placeholder={disputeMode === 'resolve' ? 'Accord trouvé avec le client…' : 'Quantité livrée contestée par le client…'}
+            />
+          </Field>
+          {disputeError && disputeText && <Alert tone="info">{disputeError}</Alert>}
+          {dispute.error && <Alert>{(dispute.error as ApiError).message}</Alert>}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" disabled={dispute.isPending} onClick={() => setDisputeMode(null)}>
+              Retour
+            </Button>
+            <Button type="submit" loading={dispute.isPending} disabled={!!disputeError}>
+              {disputeMode === 'resolve' ? 'Lever le litige' : 'Mettre en litige'}
             </Button>
           </div>
         </form>
@@ -962,7 +1213,7 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
 
       {inv.creditNotes.length > 0 && (
         <Card title="Avoirs">
-          <Table head={['Avoir', 'Date', 'Motif', 'Total', 'Réduit le dû', 'Crédit client', 'Remboursé']}>
+          <Table head={['Avoir', 'Date', 'Motif', 'Total', 'Réduit le dû', 'Crédit client', 'Remboursé', '']}>
             {inv.creditNotes.map((c) => (
               <tr key={c.id}>
                 <Td className="font-mono text-xs font-semibold">{c.number}</Td>
@@ -975,6 +1226,11 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
                 <Td className="whitespace-nowrap">{formatXOF(c.reducedDue)}</Td>
                 <Td className="whitespace-nowrap">{formatXOF(c.customerCredit)}</Td>
                 <Td className="whitespace-nowrap">{formatXOF(c.refundAmount)}</Td>
+                <Td>
+                  <Button variant="ghost" className="px-2 py-1 text-xs" loading={printing === c.id} disabled={!!printing} onClick={() => print(c.id)}>
+                    <Printer className="size-3.5" /> Imprimer
+                  </Button>
+                </Td>
               </tr>
             ))}
           </Table>
