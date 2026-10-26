@@ -1,6 +1,6 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, ArrowLeft, Ban, CheckCircle2, FileMinus, PiggyBank, Printer, Send, Wallet } from 'lucide-react';
-import { ReactNode, useState } from 'react';
+import { AlertTriangle, ArrowLeft, Ban, CheckCircle2, FileMinus, Pencil, PiggyBank, Plus, Printer, Send, Trash2, Wallet } from 'lucide-react';
+import { ReactNode, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CustomerPicker } from '../../components/CustomerPicker';
 import { Alert, Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Table, Td, Textarea } from '../../components/ui';
@@ -32,6 +32,21 @@ const OFF_REGISTER = new Set(['BANK_TRANSFER', 'CHEQUE']);
 
 const n = (v: string | number) => Number(v);
 
+/**
+ * Verrou synchrone contre le double clic : isPending n'est vrai qu'au rendu suivant, un second clic
+ * rapide enverrait sinon une seconde requête. Libéré à la fin de la requête, succès ou erreur.
+ */
+function useSubmitLock() {
+  const busy = useRef(false);
+  return (start: (release: () => void) => void) => {
+    if (busy.current) return;
+    busy.current = true;
+    start(() => {
+      busy.current = false;
+    });
+  };
+}
+
 /** Statut du document + règlement (factures ouvertes) + retard. */
 function InvoiceBadges({ status, paymentStatus, overdue }: { status: InvoiceStatus; paymentStatus: InvoicePaymentStatus | null; overdue: boolean }) {
   return (
@@ -43,19 +58,51 @@ function InvoiceBadges({ status, paymentStatus, overdue }: { status: InvoiceStat
   );
 }
 
-/** Module 7 — Factures clients (lecture seule) : liste filtrée et fiche détaillée. */
+/** « Émettre / annuler des factures » : création et modification des brouillons (le serveur reste seul juge). */
+const INVOICE_MANAGE = 'invoices.manage';
+
+/** Module 7 — Factures clients : liste filtrée, fiche détaillée, facture manuelle et brouillons. */
 export function CustomerInvoicesPage() {
+  const { establishmentId, can, canAnywhere } = useAuth();
   const [openId, setOpenId] = useState<string | null>(null);
+  // Formulaire : nouvelle facture manuelle, ou modification d'un brouillon (identifiant).
+  const [editing, setEditing] = useState<'new' | string | null>(null);
   // Filtres conservés au retour de la fiche.
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [status, setStatus] = useState('');
   const [overdue, setOverdue] = useState(false);
+  const canCreate = establishmentId ? can(INVOICE_MANAGE) : canAnywhere(INVOICE_MANAGE);
   return (
     <>
-      <PageHeader title="Factures clients" subtitle="Factures émises, règlements et avoirs — consultation" />
+      <PageHeader
+        title="Factures clients"
+        subtitle="Factures émises, règlements et avoirs"
+        actions={
+          canCreate &&
+          !editing && (
+            <Button
+              onClick={() => {
+                setOpenId(null);
+                setEditing('new');
+              }}
+            >
+              <Plus className="size-4" /> Facture manuelle
+            </Button>
+          )
+        }
+      />
       <RequirePermission permission={INVOICE_READ}>
-        {openId ? (
-          <InvoiceView id={openId} onBack={() => setOpenId(null)} />
+        {editing ? (
+          <InvoiceForm
+            invoiceId={editing === 'new' ? null : editing}
+            onCancel={() => setEditing(null)}
+            onSaved={(id) => {
+              setEditing(null);
+              setOpenId(id);
+            }}
+          />
+        ) : openId ? (
+          <InvoiceView id={openId} onBack={() => setOpenId(null)} onEdit={() => setEditing(openId)} />
         ) : (
           <InvoiceList customer={customer} setCustomer={setCustomer} status={status} setStatus={setStatus} overdue={overdue} setOverdue={setOverdue} onOpen={setOpenId} />
         )}
@@ -203,13 +250,14 @@ function PayInvoice({ inv, onClose }: { inv: InvoiceDetail; onClose: () => void 
       onClose();
     },
   });
+  const lock = useSubmitLock();
   return (
     <Modal open title={`Encaisser la facture ${inv.number}`} onClose={onClose}>
       <form
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          pay.mutate();
+          lock((release) => pay.mutate(undefined, { onSettled: release }));
         }}
       >
         <div className="text-sm">
@@ -319,13 +367,14 @@ function ApplyDeposit({ inv, onClose, onApplied }: { inv: InvoiceDetail; onClose
       onApplied({ deposit: chosen!.number, amount, balance: updated.balance });
     },
   });
+  const lock = useSubmitLock();
   return (
     <Modal open title={`Imputer un acompte — facture ${inv.number}`} onClose={() => !apply.isPending && onClose()}>
       <form
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!amountError && !apply.isPending) apply.mutate();
+          if (!amountError && !apply.isPending) lock((release) => apply.mutate(undefined, { onSettled: release }));
         }}
       >
         <div className="text-sm">
@@ -646,6 +695,7 @@ function CreateCreditNote({
       onCreated(cn);
     },
   });
+  const lock = useSubmitLock();
 
   return (
     <Modal open wide title={`Avoir sur la facture ${inv.number}`} onClose={onClose}>
@@ -653,7 +703,7 @@ function CreateCreditNote({
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!error && !create.isPending) create.mutate();
+          if (!error && !create.isPending) lock((release) => create.mutate(undefined, { onSettled: release }));
         }}
       >
         <div className="flex flex-wrap gap-4 text-sm">
@@ -815,7 +865,226 @@ function CreateCreditNote({
   );
 }
 
-function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
+interface FeeDraft {
+  key: string;
+  label: string;
+  quantity: string;
+  unitPrice: string;
+  taxRate: string;
+  note: string;
+}
+
+let feeSeq = 0;
+const newFee = (): FeeDraft => ({ key: `f${++feeSeq}`, label: '', quantity: '1', unitPrice: '', taxRate: '0', note: '' });
+
+/**
+ * Facture manuelle (POST /invoices, source MANUAL : frais seulement, aucun produit ni stock) et
+ * modification d'un brouillon (PATCH /invoices/:id) : notes pour tout brouillon, lignes pour une
+ * facture manuelle seulement. Le brouillon reste sans numéro ni effet financier jusqu'à son émission.
+ */
+function InvoiceForm({ invoiceId, onCancel, onSaved }: { invoiceId: string | null; onCancel: () => void; onSaved: (id: string) => void }) {
+  const qc = useQueryClient();
+  const { me, establishmentId: selected } = useAuth();
+  // Même identifiant à chaque tentative de ce formulaire : jamais deux factures pour un double clic.
+  const requestId = useRequestId();
+  const existing = useQuery({ queryKey: ['invoices', 'detail', invoiceId], queryFn: () => api.get<InvoiceDetail>(`/invoices/${invoiceId}`), enabled: !!invoiceId });
+  const inv = existing.data;
+  const editing = !!invoiceId;
+
+  const allowed = (me?.establishments ?? []).filter((e) => me?.globalPermissions.includes(INVOICE_MANAGE) || e.permissions.includes(INVOICE_MANAGE));
+  const [estChoice, setEstChoice] = useState('');
+  const [customer, setCustomer] = useState<Customer | null>(null);
+  const [notes, setNotes] = useState('');
+  const [lines, setLines] = useState<FeeDraft[]>([newFee()]);
+  // Brouillon existant : le formulaire reprend ses valeurs une fois chargé.
+  const [loadedFor, setLoadedFor] = useState<string | null>(null);
+  if (inv && loadedFor !== inv.id) {
+    setLoadedFor(inv.id);
+    setNotes(inv.notes ?? '');
+    setLines(
+      inv.lines.map((l) => ({
+        ...newFee(),
+        label: l.label,
+        quantity: String(n(l.quantity)),
+        unitPrice: String(n(l.unitPrice)),
+        taxRate: String(n(l.taxRate)),
+        note: l.note ?? '',
+      })),
+    );
+  }
+  const establishmentId = editing ? inv?.establishmentId ?? '' : selected ?? estChoice;
+  // Lignes : saisies pour une nouvelle facture ou un brouillon manuel ; celles d'une commande ou d'un ticket viennent de leur document.
+  const linesEditable = !editing || inv?.source === 'MANUAL';
+
+  const lineTotal = (l: FeeDraft) => Math.round((Number(l.quantity) || 0) * (Number(l.unitPrice) || 0));
+  const total = lines.reduce((s, l) => s + lineTotal(l), 0);
+  const update = (key: string, patch: Partial<FeeDraft>) => setLines((ls) => ls.map((l) => (l.key === key ? { ...l, ...patch } : l)));
+
+  const lineError = !linesEditable
+    ? null
+    : lines
+        .map((l, i) => {
+          const q = Number(l.quantity);
+          if (!(q > 0 && q <= 1e6) || Math.round(q * 10000) !== q * 10000) return `Ligne ${i + 1} : quantité positive (4 décimales au plus).`;
+          const label = l.label.trim().length;
+          if (label < 2 || label > 150) return `Ligne ${i + 1} : libellé de 2 à 150 caractères.`;
+          if (l.unitPrice.trim() === '' || !Number.isInteger(Number(l.unitPrice)) || Number(l.unitPrice) < 0) return `Ligne ${i + 1} : prix TTC entier en FCFA.`;
+          const t = Number(l.taxRate);
+          if (!(t >= 0 && t <= 100) || Math.round(t * 100) !== t * 100) return `Ligne ${i + 1} : TVA entre 0 et 100 % (2 décimales au plus).`;
+          return null;
+        })
+        .find((e) => e);
+  const error = !establishmentId
+    ? 'Choisissez l’établissement.'
+    : !editing && !customer
+      ? 'Choisissez le client.'
+      : linesEditable && lines.length === 0
+        ? 'Ajoutez au moins une ligne.'
+        : lineError ?? null;
+
+  const payloadLines = () =>
+    lines.map((l) => ({
+      kind: 'FEE',
+      label: l.label.trim(),
+      quantity: Number(l.quantity),
+      unitPrice: Number(l.unitPrice),
+      taxRate: Number(l.taxRate) || 0,
+      ...(l.note.trim() ? { note: l.note.trim() } : {}),
+    }));
+
+  const save = useMutation({
+    mutationFn: () =>
+      editing
+        ? // Établissement, client et origine ne se modifient pas (règle du serveur).
+          api.patch<InvoiceDetail>(`/invoices/${invoiceId}`, { notes: notes.trim() || null, ...(linesEditable ? { lines: payloadLines() } : {}) })
+        : api.post<InvoiceDetail>('/invoices', {
+            clientRequestId: requestId,
+            source: 'MANUAL',
+            establishmentId,
+            customerId: customer!.id,
+            ...(notes.trim() ? { notes: notes.trim() } : {}),
+            lines: payloadLines(),
+          }),
+    onSuccess: (saved) => {
+      // La réponse est la fiche de la facture : elle s'affiche sans relecture.
+      qc.setQueryData(['invoices', 'detail', saved.id], saved);
+      qc.invalidateQueries({ queryKey: ['invoices', 'list'] });
+      onSaved(saved.id);
+    },
+  });
+
+  const lock = useSubmitLock();
+
+  if (editing && existing.isLoading) return <Spinner />;
+  if (editing && (existing.error || !inv)) return <Alert>{(existing.error as ApiError | null)?.message ?? 'Facture introuvable'}</Alert>;
+  if (editing && inv && inv.status !== 'DRAFT') return <Alert>Facture {inv.number ?? ''} {inv.status === 'CANCELLED' ? 'abandonnée' : 'émise'} : elle ne se modifie plus (correction par avoir).</Alert>;
+
+  return (
+    <form
+      className="space-y-4"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!error && !save.isPending) lock((release) => save.mutate(undefined, { onSettled: release }));
+      }}
+    >
+      <Card title={editing ? 'Modifier le brouillon de facture' : 'Nouvelle facture manuelle'}>
+        <div className="grid gap-3 md:grid-cols-2">
+          {editing ? (
+            <div className="text-sm">
+              Établissement : <strong>{me?.establishments.find((e) => e.id === inv?.establishmentId)?.name ?? '—'}</strong>
+              <br />
+              Client : <strong>{inv?.customer?.name}</strong> · Origine : <strong>{inv ? INVOICE_SOURCES[inv.source] : ''}</strong>
+            </div>
+          ) : (
+            <>
+              {selected ? (
+                <div className="text-sm">
+                  Établissement : <strong>{me?.establishments.find((e) => e.id === selected)?.name ?? '—'}</strong>
+                </div>
+              ) : (
+                <Field label="Établissement">
+                  <Select required value={estChoice} onChange={(e) => setEstChoice(e.target.value)}>
+                    <option value="">— Choisir —</option>
+                    {allowed.map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.code} — {e.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
+              <div className="md:col-span-2">
+                <span className="mb-1 block text-sm font-medium text-stone-700">Client</span>
+                <CustomerPicker establishmentId={establishmentId} value={customer} onChange={setCustomer} showCredit={false} />
+              </div>
+            </>
+          )}
+          <Field label="Notes (facultatif)">
+            <Textarea rows={2} maxLength={2000} value={notes} onChange={(e) => setNotes(e.target.value)} />
+          </Field>
+        </div>
+      </Card>
+
+      {linesEditable ? (
+        <Card
+          title="Lignes (frais)"
+          actions={
+            <Button type="button" variant="secondary" onClick={() => setLines((ls) => [...ls, newFee()])}>
+              <Plus className="size-4" /> Ligne
+            </Button>
+          }
+        >
+          <div className="space-y-3">
+            {lines.map((l, i) => (
+              <div key={l.key} className="grid gap-2 rounded-lg border border-stone-200 p-3 md:grid-cols-[2fr_6rem_8rem_6rem_8rem_auto] md:items-end">
+                <Field label={`Ligne ${i + 1} — libellé`}>
+                  <Input maxLength={150} value={l.label} onChange={(e) => update(l.key, { label: e.target.value })} placeholder="Prestation, location, service…" />
+                </Field>
+                <Field label="Quantité">
+                  <Input type="number" min={0.0001} step="any" value={l.quantity} onChange={(e) => update(l.key, { quantity: e.target.value })} />
+                </Field>
+                <Field label="Prix TTC (FCFA)">
+                  <Input type="number" min={0} step={1} value={l.unitPrice} onChange={(e) => update(l.key, { unitPrice: e.target.value })} />
+                </Field>
+                <Field label="TVA (%)">
+                  <Input type="number" min={0} max={100} step={0.01} value={l.taxRate} onChange={(e) => update(l.key, { taxRate: e.target.value })} />
+                </Field>
+                <div className="text-sm">
+                  <span className="block text-sm font-medium text-stone-700">Total TTC</span>
+                  <span className="block py-2 font-semibold">{formatXOF(lineTotal(l))}</span>
+                </div>
+                <Button type="button" variant="ghost" aria-label="Retirer la ligne" disabled={lines.length === 1} onClick={() => setLines((ls) => ls.filter((x) => x.key !== l.key))}>
+                  <Trash2 className="size-4" />
+                </Button>
+                <div className="md:col-span-6">
+                  <Input maxLength={500} value={l.note} onChange={(e) => update(l.key, { note: e.target.value })} placeholder="Note de ligne (facultatif)" />
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex justify-end text-base font-bold">Total TTC estimé : {formatXOF(total)}</div>
+          <p className="mt-1 text-right text-xs text-stone-500">Une facture manuelle ne contient que des frais ; un produit se facture depuis sa commande ou son ticket. Total arrondi par le serveur.</p>
+        </Card>
+      ) : (
+        <Alert tone="info">Les lignes de ce brouillon viennent de {inv?.order ? `la commande ${inv.order.number}` : inv?.sale ? `du ticket ${inv.sale.number}` : 'leur document'} : seules les notes se modifient ici.</Alert>
+      )}
+
+      {!editing && <p className="text-xs text-stone-500">La facture est créée en brouillon, sans numéro : aucun encaissement ni effet sur le crédit client avant son émission.</p>}
+      {error && <Alert tone="info">{error}</Alert>}
+      {save.error && <Alert>{(save.error as ApiError).message}</Alert>}
+      <div className="flex justify-end gap-2">
+        <Button type="button" variant="ghost" disabled={save.isPending} onClick={onCancel}>
+          Annuler
+        </Button>
+        <Button type="submit" loading={save.isPending} disabled={!!error}>
+          {editing ? 'Enregistrer le brouillon' : 'Créer le brouillon'}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function InvoiceView({ id, onBack, onEdit }: { id: string; onBack: () => void; onEdit: () => void }) {
   const { me } = useAuth();
   const [paying, setPaying] = useState(false);
   const [crediting, setCrediting] = useState(false);
@@ -864,6 +1133,9 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
       setDisputeMode(null);
     },
   });
+  const issueLock = useSubmitLock();
+  const abandonLock = useSubmitLock();
+  const disputeLock = useSubmitLock();
   const openDispute = (mode: 'open' | 'resolve') => {
     setDisputeText('');
     dispute.reset();
@@ -943,6 +1215,11 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
             </Button>
           )}
           {canIssue && (
+            <Button variant="secondary" disabled={issue.isPending || abandon.isPending} onClick={onEdit}>
+              <Pencil className="size-4" /> Modifier
+            </Button>
+          )}
+          {canIssue && (
             <Button disabled={issue.isPending} onClick={() => setIssuing(true)}>
               <Send className="size-4" /> Émettre la facture
             </Button>
@@ -985,7 +1262,7 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
           className="space-y-3 text-sm"
           onSubmit={(e) => {
             e.preventDefault();
-            if (!abandonError && !abandon.isPending) abandon.mutate();
+            if (!abandonError && !abandon.isPending) abandonLock((release) => abandon.mutate(undefined, { onSettled: release }));
           }}
         >
           <p>
@@ -1030,7 +1307,7 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
           className="space-y-3 text-sm"
           onSubmit={(e) => {
             e.preventDefault();
-            if (disputeMode && !disputeError && !dispute.isPending) dispute.mutate(disputeMode);
+            if (disputeMode && !disputeError && !dispute.isPending) disputeLock((release) => dispute.mutate(disputeMode, { onSettled: release }));
           }}
         >
           {disputeMode === 'resolve' ? (
@@ -1076,7 +1353,7 @@ function InvoiceView({ id, onBack }: { id: string; onBack: () => void }) {
             <Button variant="ghost" disabled={issue.isPending} onClick={() => setIssuing(false)}>
               Retour
             </Button>
-            <Button loading={issue.isPending} onClick={() => !issue.isPending && issue.mutate()}>
+            <Button loading={issue.isPending} onClick={() => !issue.isPending && issueLock((release) => issue.mutate(undefined, { onSettled: release }))}>
               Émettre la facture
             </Button>
           </div>
