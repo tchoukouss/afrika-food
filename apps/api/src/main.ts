@@ -30,7 +30,8 @@ async function bootstrap() {
     SwaggerModule.setup('api/docs', app, doc);
   }
 
-  await app.listen(config.port);
+  // Écoute locale uniquement : l'API n'est joignable que via le reverse proxy.
+  await app.listen(config.port, '127.0.0.1');
   Logger.log(`AFRIKA FOOD API sur http://localhost:${config.port}/api (docs : /api/docs)`, 'Bootstrap');
 }
 
